@@ -1,0 +1,172 @@
+name: 'release'
+
+on:
+  push:
+    branches:
+      - master
+
+
+jobs:
+  prepare:
+    name: Build FFmpeg
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache FFmpeg
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg
+      - name: Build FFmpeg sidecars
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir src-tauri/binaries
+          sh src-tauri/ffmpeg/build-windows.sh
+          ls -all -h src-tauri/binaries
+      - name: Build FFmpeg sidecars
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sh src-tauri/ffmpeg/build-linux.sh
+          ls -all -h src-tauri/binaries
+      - name: Upload platform bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg
+          if-no-files-found: error
+          path: src-tauri/binaries/*
+      
+  build:
+    needs: ["prepare"]
+    permissions:
+      contents: write
+    outputs: 
+       releaseId: ${{ steps.build.outputs.releaseId }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest' # for Arm based macs (M1 and above).
+            rust_target: aarch64-apple-darwin
+          - platform: 'ubuntu-24.04'
+            rust_target: x86_64-unknown-linux-gnu
+          - platform: 'windows-latest'
+            rust_target: x86_64-pc-windows-msvc
+
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Download FFmpeg
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: ffmpeg*
+          path: src-tauri/binaries/
+      - name: install dependencies (ubuntu only)
+        if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
+        run: |
+            sudo apt update
+            sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+      - name: install frontend dependencies
+        run: |
+          npm install
+      - name: Build
+        uses: tauri-apps/tauri-action@v1
+        id: build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: "temp" # the action automatically replaces \_\_VERSION\_\_ with the app version.
+          releaseName: "temp"
+          releaseBody: ''
+          releaseDraft: true
+          prerelease: false
+      - name: Test Version
+        run: |
+          cd src-tauri && cargo run -- -v
+
+      # - name: upload
+      #   uses: actions/upload-artifact@v7
+      #   with:
+      #     name: artifacts-${{ runner.os }}
+      #     path:
+      #       "${{ join(fromJSON(steps.build.outputs.artifactPaths), '\n') }}"
+  release:
+    needs: ["build"]
+    permissions:
+      contents: write
+    
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Release Ready
+        id: ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+            new_tag=$(date +%Y%m%d)
+            now_tag=$(curl -sSf https://api.github.com/repos/${{github.repository}}/releases/latest | jq --raw-output '.tag_name')
+            if [[ "$new_tag" = "$now_tag" ]]; then
+              echo "delete $now_tag"
+              gh release delete $now_tag
+              now_tag=$(curl -sSf https://api.github.com/repos/${{github.repository}}/releases | jq --raw-output '.[0].tag_name')
+            fi
+            commit=$(git rev-list -n 1 $now_tag || echo "null")
+            echo "$commit"
+
+            if gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" /repos/${{ github.repository }}/tags | jq -e --arg tag "$new_tag" 'any(.[]; .name == $tag)' > /dev/null; then
+                echo "delete remote tag $new_tag"
+                git push origin --delete $new_tag
+                git tag -d $new_tag || true
+            fi
+            git tag $new_tag
+            echo "create tag $new_tag"
+            git push origin $new_tag
+            # commit=$(git --no-pager log --pretty=format:"%H" | grep -B 1 $commit | head -n 1)
+            echo "after-$commit"
+            msg=""
+            if [[ "$commit" != "null" ]]; then
+              msg=$(git --no-pager log --pretty=format:"- [%s](https://github.com/${{ github.repository}}/commit/%H)" $commit..HEAD)
+            fi
+            echo "$msg" > body.md
+            echo "body=$msg" >> $GITHUB_OUTPUT
+            
+            echo "tag=$new_tag" >> $GITHUB_OUTPUT
+            # 如果直接指向master，release会落后一个commit
+            # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
+      - name: Delete Temp Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download temp -D app
+          ls -all app
+          gh release delete temp -y
+      # - name: Download Artifacts
+      #   uses: actions/download-artifact@v8
+      #   with:
+      #     pattern: artifacts-*
+      #     path: artifacts
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          artifacts: "app/*"
+          bodyFile: "body.md"
+          tag: ${{ steps.ready.outputs.tag }}

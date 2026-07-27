@@ -1,0 +1,61 @@
+FROM debian:bookworm-slim AS build
+
+ARG FFMPEG_REF=n7.1.1
+ARG TARGETARCH
+
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://repo.huaweicloud.com/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://repo.huaweicloud.com/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gcc \
+        git \
+        libc6-dev \
+        make \
+        nasm \
+        pkg-config \
+        yasm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --depth 1 --branch "${FFMPEG_REF}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+WORKDIR /src/ffmpeg
+
+RUN case "${TARGETARCH}" in \
+        amd64) ffmpeg_arch=x86_64 ;; \
+        arm64) ffmpeg_arch=aarch64 ;; \
+        *) echo "Unsupported Linux architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && ./configure \
+        --prefix=/opt/ffmpeg \
+        --arch="${ffmpeg_arch}" \
+        --target-os=linux \
+        --enable-static \
+        --disable-shared \
+        --disable-everything \
+        --disable-programs \
+        --enable-ffmpeg \
+        --enable-ffprobe \
+        --disable-avdevice \
+        --enable-avfilter \
+        --disable-swresample \
+        --disable-swscale \
+        --disable-network \
+        --disable-doc \
+        --disable-debug \
+        --enable-protocol=file,pipe \
+        --enable-demuxer=matroska,ass,srt \
+        --enable-muxer=matroska,ass,srt \
+        --enable-decoder=ass,ssa,subrip \
+        --enable-encoder=ass,ssa,subrip \
+    && make -j"$(nproc)" \
+    && make install
+
+FROM scratch AS export
+
+COPY --from=build /opt/ffmpeg/bin/ffmpeg /ffmpeg
+COPY --from=build /opt/ffmpeg/bin/ffprobe /ffprobe
