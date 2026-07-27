@@ -1,0 +1,83 @@
+ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+FROM ${OSXCROSS_IMAGE} AS osxcross
+
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/debian:trixie-slim AS build
+
+ARG FFMPEG_REF=n7.1.1
+ARG TARGET_ARCH
+ARG MACOS_MIN_VERSION=11.0
+
+ENV MACOSX_DEPLOYMENT_TARGET=${MACOS_MIN_VERSION}
+ENV PATH=/osxcross/bin:${PATH}
+
+COPY --from=osxcross /osxcross /osxcross
+
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian|http://repo.huaweicloud.com/debian|g' \
+        -e 's|http://security.debian.org/debian-security|http://repo.huaweicloud.com/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gcc \
+        git \
+        libc6-dev \
+        make \
+        nasm \
+        pkg-config \
+        yasm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --depth 1 --branch "${FFMPEG_REF}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+WORKDIR /src/ffmpeg
+
+RUN case "${TARGET_ARCH}" in \
+        x86_64) compiler_pattern='x86_64-apple-darwin*-clang' ;; \
+        aarch64) compiler_pattern='arm64-apple-darwin*-clang' ;; \
+        *) echo "Unsupported macOS architecture: ${TARGET_ARCH}" >&2; exit 1 ;; \
+    esac \
+    && cross_cc=$(find /osxcross/bin -maxdepth 1 -name "${compiler_pattern}" | head -n 1) \
+    && test -n "${cross_cc}" \
+    && cross_prefix=${cross_cc%-clang} \
+    && ./configure \
+        --prefix=/opt/ffmpeg \
+        --arch="${TARGET_ARCH}" \
+        --target-os=darwin \
+        --cc="${cross_cc}" \
+        --cxx="${cross_prefix}-clang++" \
+        --ar="${cross_prefix}-ar" \
+        --nm="${cross_prefix}-nm" \
+        --ranlib="${cross_prefix}-ranlib" \
+        --strip="${cross_prefix}-strip" \
+        --enable-cross-compile \
+        --enable-static \
+        --disable-shared \
+        --disable-everything \
+        --disable-programs \
+        --enable-ffmpeg \
+        --enable-ffprobe \
+        --disable-avdevice \
+        --enable-avfilter \
+        --disable-swresample \
+        --disable-swscale \
+        --disable-network \
+        --disable-doc \
+        --disable-debug \
+        --enable-protocol=file,pipe \
+        --enable-demuxer=matroska,ass,srt \
+        --enable-muxer=matroska,ass,srt \
+        --enable-decoder=ass,ssa,subrip \
+        --enable-encoder=ass,ssa,subrip || (cat ffbuild/config.log && exit 1)\
+    # The Trixie host has <stdbit.h>, but osxcross's macOS SDK does not.  Do not
+    # let configure's host-header probe enable an unavailable target header.
+    && sed -i 's/^#define HAVE_STDBIT_H 1$/#define HAVE_STDBIT_H 0/' config.h \
+    && make -j"$(nproc)" \
+    && make install
+
+FROM scratch AS export
+
+COPY --from=build /opt/ffmpeg/bin/ffmpeg /ffmpeg
+COPY --from=build /opt/ffmpeg/bin/ffprobe /ffprobe

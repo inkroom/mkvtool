@@ -1,0 +1,58 @@
+FROM debian:bookworm-slim AS build
+
+ARG FFMPEG_REF=n7.1.1
+
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://repo.huaweicloud.com/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://repo.huaweicloud.com/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gcc \
+        gcc-mingw-w64-x86-64-posix \
+        git \
+        libc6-dev \
+        make \
+        nasm \
+        pkg-config \
+        yasm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --depth 1 --branch "${FFMPEG_REF}" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+WORKDIR /src/ffmpeg
+
+RUN ./configure \
+        --prefix=/opt/ffmpeg \
+        --arch=x86_64 \
+        --target-os=mingw32 \
+        --cross-prefix=x86_64-w64-mingw32- \
+        --enable-cross-compile \
+        --enable-static \
+        --disable-shared \
+        --disable-everything \
+        --disable-programs \
+        --enable-ffmpeg \
+        --enable-ffprobe \
+        --disable-avdevice \
+        --enable-avfilter \
+        --disable-swresample \
+        --disable-swscale \
+        --disable-network \
+        --disable-doc \
+        --disable-debug \
+        --enable-protocol=file,pipe \
+        --enable-demuxer=matroska,ass,srt \
+        --enable-muxer=matroska,ass,srt \
+        --enable-decoder=ass,ssa,subrip \
+        --enable-encoder=ass,ssa,subrip
+RUN  make -j"$(nproc)" \
+    && make install
+
+FROM scratch AS export
+
+COPY --from=build /opt/ffmpeg/bin/ffmpeg.exe /ffmpeg.exe
+COPY --from=build /opt/ffmpeg/bin/ffprobe.exe /ffprobe.exe

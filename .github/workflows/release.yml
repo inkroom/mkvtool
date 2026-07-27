@@ -1,0 +1,164 @@
+name: 'release'
+
+on:
+  push:
+    branches:
+      - master
+
+
+jobs:
+  prepare:
+    name: Build FFmpeg
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs: 
+       tag: ${{ steps.ready.outputs.tag }}
+       body: ${{ steps.ready.outputs.body }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build FFmpeg sidecars
+        shell: bash
+        run: |
+          mkdir src-tauri/binaries
+          sh src-tauri/ffmpeg/build-windows.sh
+          ls -all -h src-tauri/binaries
+      - name: Build FFmpeg sidecars
+        shell: bash
+        run: |
+          sh src-tauri/ffmpeg/build-linux.sh
+          ls -all -h src-tauri/binaries
+      - name: Upload platform bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg
+          if-no-files-found: error
+          path: src-tauri/binaries/*
+      - name: Release Ready
+        id: ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+            new_tag=$(date +%Y%m%d)
+            now_tag=$(curl -sSf https://api.github.com/repos/inkroom/m3u8-dl/releases/latest | jq --raw-output '.tag_name')
+            if [[ "$new_tag" = "$now_tag" ]]; then
+              echo "delete $now_tag"
+              gh release delete $now_tag
+              now_tag=$(curl -sSf https://api.github.com/repos/inkroom/m3u8-dl/releases | jq --raw-output '.[0].tag_name')
+            fi
+            commit=$(git rev-list -n 1 $now_tag || echo "null")
+            echo "$commit"
+
+            temp=$(git --no-pager tag | grep $new_tag || echo "")
+            if [[ "$temp" = "$new_tag" ]]; then
+                echo "delete remote tag $new_tag"
+                git push origin --delete $new_tag
+                git tag -d $new_tag
+            fi
+            git tag $new_tag
+            echo "create tag $new_tag"
+            git push origin $new_tag
+            # commit=$(git --no-pager log --pretty=format:"%H" | grep -B 1 $commit | head -n 1)
+            echo "after-$commit"
+            msg=""
+            if [[ "$commit" != "null" ]]; then
+              msg=$(git --no-pager log --pretty=format:"- [%s](https://github.com/${{ github.repository}}/commit/%H)" $commit..HEAD)
+            fi
+            echo "$msg" > body.md
+            echo "body=$msg" >> $GITHUB_OUTPUT
+            
+            echo "tag=$new_tag" >> $GITHUB_OUTPUT
+            # 如果直接指向master，release会落后一个commit
+            # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
+
+  prepare-mac:
+    name: Build FFmpeg Macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build FFmpeg sidecars
+        shell: bash
+        run: |
+          brew install ffmpeg pkg-config tree
+          mkdir src-tauri/binaries
+          git clone https://github.com/ffmpeg/ffmpeg -b release/8.1 --depth=1 ffmpeg
+          cd ffmpeg
+          mkdir dist
+          ./configure --prefix=dist/ \
+            --disable-everything \
+            --extra-cflags='-march=native -mtune=native' \
+            --disable-debug --disable-stripping --enable-static \
+            --disable-shared --enable-pthreads --disable-pic \
+            --disable-autodetect --disable-programs --disable-doc \
+            --disable-gpl --disable-version3 --disable-nonfree \
+            --enable-avcodec --disable-avdevice \
+            --enable-avformat --disable-swresample --disable-swscale \
+            --extra-cflags=-w \
+            --disable-programs \
+            --enable-ffmpeg \
+            --enable-ffprobe \
+            --enable-avfilter \
+            --enable-protocol=file,pipe \
+            --enable-demuxer=matroska,ass,srt \
+            --enable-muxer=matroska,ass,srt \
+            --enable-decoder=ass,ssa,subrip \
+            --enable-encoder=ass,ssa,subrip || (cat ffbuild/config.log && exit 1)\
+          && make -j"$(nproc)" \
+          && make install
+          tree dist
+          mv dist/bin/ffmpeg dist/bin/ffmpeg-aarch64-apple-darwin
+          mv dist/bin/ffprobe dist/bin/ffprobe-aarch64-apple-darwin
+      - name: Upload platform bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-mac
+          if-no-files-found: error
+          path: ffmpeg/dist/bin/*
+
+  release:
+    needs: ["prepare","prepare-mac"]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest' # for Arm based macs (M1 and above).
+          - platform: 'ubuntu-24.04'
+          - platform: 'windows-latest'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Download FFmpeg
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: ffmpeg*
+          path: src-tauri/binaries/
+      - name: install dependencies (ubuntu only)
+        if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
+        run: |
+          sudo apt update
+          sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: install frontend dependencies
+        run: |
+          npm install
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ needs.prepare.outputs.tag }} # the action automatically replaces \_\_VERSION\_\_ with the app version.
+          releaseName: ${{ needs.prepare.outputs.tag }}
+          releaseBody: ${{ needs.prepare.outputs.body }}
+          releaseDraft: true
+          prerelease: false
