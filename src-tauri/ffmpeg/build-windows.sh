@@ -24,8 +24,10 @@ unset GITHUB_REPOSITORY
 zip_file=$(find $output_dir -name *.zip | head -n 1)
 unzip $zip_file -d $output_dir
 ls -all -h $output_dir
+ff=$(find -r $output_dir -name ffmpeg.exe | head -n 1)
+fp=$(find -r $output_dir -name ffprobe.exe | head -n 1 )
 
 
 
-install -m 755 "$output_dir/bin/ffmpeg.exe" "$src_tauri_dir/binaries/ffm-x86_64-pc-windows-msvc.exe"
-install -m 755 "$output_dir/bin/ffprobe.exe" "$src_tauri_dir/binaries/ffp-x86_64-pc-windows-msvc.exe"
+install -m 755 "$ff" "$src_tauri_dir/binaries/ffm-x86_64-pc-windows-msvc.exe"
+install -m 755 "$fp" "$src_tauri_dir/binaries/ffp-x86_64-pc-windows-msvc.exe"
