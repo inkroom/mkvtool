@@ -26,6 +26,7 @@
   },
   "bundle": {
     "active": true,
+    "useLocalToolsDir": true,
     "targets": "all",
     "externalBin": [
       "binaries/ffm",

@@ -94,14 +94,12 @@ fn build_macos_sidecars() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    let install_dir = source_dir.join("dist");
     let jobs = std::thread::available_parallelism()?.get().to_string();
     println!("cargo:warning=Building native macOS FFmpeg sidecars for {target}");
     run_command(
         Command::new(source_dir.join("configure"))
             .current_dir(&source_dir)
             .args([
-                "--prefix=dist/",
                 "--disable-everything",
                 "--extra-cflags=-march=native -mtune=native",
                 "--disable-debug",
@@ -139,14 +137,10 @@ fn build_macos_sidecars() -> Result<(), Box<dyn std::error::Error>> {
             .arg(format!("-j{jobs}")),
         "编译 FFmpeg",
     )?;
-    run_command(
-        Command::new("make").current_dir(&source_dir).arg("install"),
-        "安装 FFmpeg",
-    )?;
 
     fs::create_dir_all(&binaries_dir)?;
-    fs::copy(install_dir.join("bin/ffmpeg"), &ffmpeg)?;
-    fs::copy(install_dir.join("bin/ffprobe"), &ffprobe)?;
+    fs::copy(source_dir.join("ffmpeg"), &ffmpeg)?;
+    fs::copy(source_dir.join("ffprobe"), &ffprobe)?;
     make_executable(&ffmpeg)?;
     make_executable(&ffprobe)?;
     ensure_binaries_exist(&ffmpeg, &ffprobe)

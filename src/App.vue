@@ -84,12 +84,6 @@ async function closeWindow() {
   await getCurrentWindow().close();
 }
 
-function startWindowDragging(event) {
-  if (event.button !== 0 || event.target.closest("button")) return;
-  event.preventDefault();
-  getCurrentWindow().startDragging().catch(() => {});
-}
-
 async function selectStream(stream) {
   selectedStream.value = stream;
   subtitle.value = null;
@@ -241,7 +235,8 @@ onBeforeUnmount(() => unlistenDrop?.());
 
 <template>
   <main class="app-shell">
-    <div class="window-bar" :class="{ 'macos-window-bar': isMacOS }" data-tauri-drag-region @mousedown="startWindowDragging" @selectstart.prevent @dragstart.prevent>
+    <div class="window-bar" :class="{ 'macos-window-bar': isMacOS }" @selectstart.prevent @dragstart.prevent>
+      <div class="window-drag-area" data-tauri-drag-region aria-hidden="true"></div>
       <span class="window-title">MKV 字幕工作台</span>
       <div class="window-controls" @mousedown.stop>
         <template v-if="isMacOS">
@@ -370,7 +365,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .loading-overlay { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 24px; background: #080d18bd; backdrop-filter: blur(3px); }
 .loading-card { display: grid; justify-items: center; gap: 13px; min-width: 300px; padding: 28px 32px; border: 1px solid #405c91; border-radius: 14px; color: #edf3ff; background: #14213ad9; box-shadow: 0 20px 60px #0008; text-align: center; }.loading-card small { color: #aebcd5; }.loading-spinner { width: 34px; height: 34px; border: 4px solid #7fe2b744; border-top-color: #7fe2b7; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 .app-shell { width: 100%; height: 100vh; min-height: 0; display: flex; flex-direction: column; }
-.window-bar { position: relative; z-index: 11; height: 34px; flex: 0 0 34px; display: flex; align-items: center; border-bottom: 1px solid #283650; color: #aebbd4; background: #101827; user-select: none; -webkit-user-select: none; }.window-title { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: .72rem; font-weight: 700; }.window-controls { z-index: 1; align-self: stretch; display: flex; margin-left: auto; }.window-control { width: 42px; height: 34px; display: grid; place-items: center; padding: 0; border: 0; color: #cbd7ec; background: transparent; font-size: 1.05rem; line-height: 1; }.window-control:hover { background: #25344f; }.close-window:hover { color: #fff; background: #bf3944; }.macos-window-bar .window-controls { align-items: center; gap: 8px; margin-right: auto; margin-left: 0; padding: 0 12px; }.macos-window-bar .window-control { width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; border-radius: 50%; color: transparent; font-size: .68rem; font-weight: 800; line-height: 12px; }.macos-window-bar .window-control span { display: block; height: 12px; line-height: 11px; transform: translateY(-.5px); }.macos-window-bar .close-window { background: #ff5f57; }.macos-window-bar .minimize-window { background: #febc2e; }.macos-window-bar .window-control:hover { color: #4d3220; }.macos-window-bar .close-window:hover { background: #ff5f57; }.macos-window-bar .minimize-window:hover { background: #febc2e; }
+.window-bar { position: relative; z-index: 11; height: 34px; flex: 0 0 34px; display: flex; align-items: center; border-bottom: 1px solid #283650; color: #aebbd4; background: #101827; user-select: none; -webkit-user-select: none; }.window-drag-area { position: absolute; inset: 0; }.window-title { position: absolute; z-index: 1; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: .72rem; font-weight: 700; }.window-controls { z-index: 2; align-self: stretch; display: flex; margin-left: auto; }.window-control { width: 42px; height: 34px; display: grid; place-items: center; padding: 0; border: 0; color: #cbd7ec; background: transparent; font-size: 1.05rem; line-height: 1; }.window-control:hover { background: #25344f; }.close-window:hover { color: #fff; background: #bf3944; }.macos-window-bar .window-controls { align-items: center; gap: 8px; margin-right: auto; margin-left: 0; padding: 0 12px; }.macos-window-bar .window-control { width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; border-radius: 50%; color: transparent; font-size: .68rem; font-weight: 800; line-height: 12px; }.macos-window-bar .window-control span { display: block; height: 12px; line-height: 11px; transform: translateY(-.5px); }.macos-window-bar .close-window { background: #ff5f57; }.macos-window-bar .minimize-window { background: #febc2e; }.macos-window-bar .window-control:hover { color: #4d3220; }.macos-window-bar .close-window:hover { background: #ff5f57; }.macos-window-bar .minimize-window:hover { background: #febc2e; }
 .editor-header, .file-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .eyebrow { color: #75a7ff; font-size: .71rem; letter-spacing: .16em; font-weight: 800; margin: 0 0 4px; }
 h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }

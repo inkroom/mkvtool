@@ -82,7 +82,7 @@ jobs:
         if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
         run: |
             sudo apt update
-            sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+            sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils zip
       - name: install frontend dependencies
         run: |
           npm install
@@ -97,16 +97,58 @@ jobs:
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-      - name: Test Version
+      - name: Test Version (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cd src-tauri && cargo run --release -- -v
+          ./src-tauri/target/release/mkv -v
 
-      # - name: upload
-      #   uses: actions/upload-artifact@v7
-      #   with:
-      #     name: artifacts-${{ runner.os }}
-      #     path:
-      #       "${{ join(fromJSON(steps.build.outputs.artifactPaths), '\n') }}"
+      - name: Test Version (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\src-tauri\target\release\mkv.exe -v
+
+      - name: Create portable Linux ZIP
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir=src-tauri/target/release
+          portable_dir=artifacts/mkv-linux-x64
+          mkdir -p "$portable_dir"
+          find "$release_dir" -maxdepth 1 -type f -perm -111 ! -name '*.*' -exec cp -p {} "$portable_dir/" \;
+          (cd artifacts && zip -r mkv-linux-x64.zip mkv-linux-x64)
+
+      - name: Create portable macOS ZIP
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir=src-tauri/target/release
+          portable_dir=artifacts/mkv-macos-aarch64
+          mkdir -p "$portable_dir"
+          find "$release_dir" -maxdepth 1 -type f -perm -111 ! -name '*.*' -exec cp -p {} "$portable_dir/" \;
+          (cd artifacts && zip -r mkv-macos-aarch64.zip mkv-macos-aarch64)
+
+      - name: Create portable Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseDir = "src-tauri/target/release"
+          $portableDir = "artifacts/mkv-windows-x64"
+          $zipPath = "artifacts/mkv-windows-x64.zip"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          $executables = Get-ChildItem $releaseDir -File -Filter "*.exe"
+          $executables | Copy-Item -Destination $portableDir
+          Compress-Archive -Path $portableDir -DestinationPath $zipPath -Force
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-${{ runner.os }}
+          if-no-files-found: error
+          path: artifacts/*.zip
   release:
     needs: ["build"]
     permissions:
@@ -150,23 +192,25 @@ jobs:
             echo "tag=$new_tag" >> $GITHUB_OUTPUT
             # 如果直接指向master，release会落后一个commit
             # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: artifacts-*
+          path: artifacts
       - name: Delete Temp Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download temp -D app
-          ls -all app
+          ls -all app artifacts
           gh release delete temp -y
-      # - name: Download Artifacts
-      #   uses: actions/download-artifact@v8
-      #   with:
-      #     pattern: artifacts-*
-      #     path: artifacts
       - name: Create Release
         uses: ncipollo/release-action@v1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          artifacts: "app/*"
+          artifacts: "app/*,artifacts/*"
           bodyFile: "body.md"
           tag: ${{ steps.ready.outputs.tag }}
