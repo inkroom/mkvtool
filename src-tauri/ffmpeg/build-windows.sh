@@ -3,7 +3,7 @@ set -eu
 FFMPEG_ARCH="win64"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 src_tauri_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-output_dir="artifacts/bin"
+output_dir="artifacts/"
 
 FFMPEG_REF="7.1"
 # 修改构建参数
@@ -21,6 +21,11 @@ cd FFmpeg-Builds
 unset GITHUB_REPOSITORY
 ./build.sh $FFMPEG_ARCH lgpl $FFMPEG_REF
 
+zip_file=$(find $output_dir -name *.zip | head -n 1)
+zip $zip_file -d $output_dir
+ls -all -h $output_dir
 
-install -m 755 "$output_dir/ffmpeg.exe" "$src_tauri_dir/binaries/ffm-x86_64-pc-windows-msvc.exe"
-install -m 755 "$output_dir/ffprobe.exe" "$src_tauri_dir/binaries/ffp-x86_64-pc-windows-msvc.exe"
+
+
+install -m 755 "$output_dir/bin/ffmpeg.exe" "$src_tauri_dir/binaries/ffm-x86_64-pc-windows-msvc.exe"
+install -m 755 "$output_dir/bin/ffprobe.exe" "$src_tauri_dir/binaries/ffp-x86_64-pc-windows-msvc.exe"
