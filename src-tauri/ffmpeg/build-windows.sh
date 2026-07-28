@@ -13,12 +13,12 @@ cat <<EOF > Dockerfile.tmp
     ENV FF_CONFIGURE="$FF_CONFIGURE"
 EOF
 
-docker build . -t ghcr.io/ffmpeg-builds/$FFMPEG_ARCH-lgpl-$FFMPEG_REF -f Dockerfile.tmp
+docker build . -t ghcr.io/btbn/ffmpeg-builds/$FFMPEG_ARCH-lgpl-$FFMPEG_REF -f Dockerfile.tmp
 
 
 git clone https://github.com/BtbN/FFmpeg-Builds
 cd FFmpeg-Builds
-
+unset GITHUB_REPOSITORY
 ./build.sh $FFMPEG_ARCH lgpl $FFMPEG_REF
 
 
