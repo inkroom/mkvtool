@@ -22,7 +22,7 @@ unset GITHUB_REPOSITORY
 ./build.sh $FFMPEG_ARCH lgpl $FFMPEG_REF
 
 zip_file=$(find $output_dir -name *.zip | head -n 1)
-zip $zip_file -d $output_dir
+unzip $zip_file -d $output_dir
 ls -all -h $output_dir
 
 
