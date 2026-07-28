@@ -24,8 +24,8 @@ unset GITHUB_REPOSITORY
 zip_file=$(find $output_dir -name *.zip | head -n 1)
 unzip $zip_file -d $output_dir
 ls -all -h $output_dir
-ff=$(find -r $output_dir -name ffmpeg.exe | head -n 1)
-fp=$(find -r $output_dir -name ffprobe.exe | head -n 1 )
+ff=$(find $output_dir -name ffmpeg.exe | head -n 1)
+fp=$(find $output_dir -name ffprobe.exe | head -n 1 )
 
 
 
