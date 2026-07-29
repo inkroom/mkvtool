@@ -177,6 +177,13 @@ function timestampMilliseconds(value) {
   );
 }
 
+function startTimestampMilliseconds(value) {
+  const match = value.match(/^(\d+):([0-5]\d):([0-5]\d)\.(\d{3})$/);
+  if (!match) return null;
+  const [, hours, minutes, seconds, milliseconds] = match;
+  return (Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds)) * 1000 + Number(milliseconds);
+}
+
 function shiftTimestamp(value, milliseconds, separator = ".") {
   const match = value.match(/^(\d+):(\d{2}):(\d{2})[.,:](\d{2,3})$/);
   const sourceMilliseconds = timestampMilliseconds(value);
@@ -196,9 +203,9 @@ function shiftSubtitles(direction) {
   const milliseconds = Math.round(Number(timestampOffset.value) * direction);
   if (!Number.isFinite(milliseconds) || milliseconds === 0 || !subtitle.value) return;
   const startValue = timestampStart.value.trim();
-  const startMilliseconds = startValue ? timestampMilliseconds(startValue) : null;
+  const startMilliseconds = startValue ? startTimestampMilliseconds(startValue) : null;
   if (startValue && startMilliseconds === null) {
-    showError("起始时间格式无效，请输入 0:00:00.00 或 00:00:00,000。");
+    showError("起始时间格式无效，请输入 0:00:00.000。");
     return;
   }
   if (subtitle.value.format === "ass") {
@@ -325,14 +332,13 @@ onBeforeUnmount(() => unlistenDrop?.());
           <div class="timestamp-toolbar">
             <span>时间戳偏移</span>
             <button @click="shiftSubtitles(-1)">提前</button>
-            <input v-model.number="timestampOffset" type="number" min="1" step="100" aria-label="时间戳偏移毫秒" />
+            <input v-model.number="timestampOffset" type="input" aria-label="时间戳偏移毫秒" />
             <span>ms</span>
             <button @click="shiftSubtitles(1)">推迟</button>
           </div>
           <div class="timestamp-start-row">
             <label for="timestamp-start">起始时间</label>
-            <input id="timestamp-start" v-model="timestampStart" class="timestamp-start" placeholder="留空为全部字幕" aria-label="时间轴偏移起始时间" />
-            <small>格式：ASS 使用 <code>0:00:00.00</code>；SRT/WebVTT 使用 <code>00:00:00,000</code>。</small>
+            <input id="timestamp-start" v-model="timestampStart" class="timestamp-start" placeholder="0:00:00.000（留空处理全部）" aria-label="时间轴偏移起始时间" />
           </div>
           <textarea v-model="subtitleContent" spellcheck="false" aria-label="字幕内容" />
         </template>
@@ -362,6 +368,13 @@ body { margin: 0; min-width: 760px; height: 100vh; overflow: hidden; background:
 button, textarea { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: wait; opacity: .65; }
+.sidebar, textarea { scrollbar-width: thin; scrollbar-color: #536987 #101827; }
+.sidebar::-webkit-scrollbar, textarea::-webkit-scrollbar { width: 10px; height: 10px; }
+.sidebar::-webkit-scrollbar-track, textarea::-webkit-scrollbar-track { background: #101827; }
+.sidebar::-webkit-scrollbar-thumb, textarea::-webkit-scrollbar-thumb { min-height: 36px; border: 2px solid #101827; border-radius: 999px; background: #536987; }
+.sidebar::-webkit-scrollbar-thumb:hover, textarea::-webkit-scrollbar-thumb:hover { background: #7188aa; }
+.sidebar::-webkit-scrollbar-corner, textarea::-webkit-scrollbar-corner { background: #101827; }
+.sidebar::-webkit-scrollbar-button, textarea::-webkit-scrollbar-button { width: 0; height: 0; }
 .loading-overlay { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 24px; background: #080d18bd; backdrop-filter: blur(3px); }
 .loading-card { display: grid; justify-items: center; gap: 13px; min-width: 300px; padding: 28px 32px; border: 1px solid #405c91; border-radius: 14px; color: #edf3ff; background: #14213ad9; box-shadow: 0 20px 60px #0008; text-align: center; }.loading-card small { color: #aebcd5; }.loading-spinner { width: 34px; height: 34px; border: 4px solid #7fe2b744; border-top-color: #7fe2b7; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 .app-shell { width: 100%; height: 100vh; min-height: 0; display: flex; flex-direction: column; }
@@ -377,5 +390,5 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
 .sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }.file-badge { padding: 7px 5px; border-radius: 5px; color: #0c1b2d; background: #7fe2b7; font-size: .68rem; font-weight: 900; }
 .stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; }.stream-row:hover { background: #1a2740; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
-.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { padding-top: 6px; padding-bottom: 9px; border-bottom: 1px solid #2b3855; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-row .timestamp-start { width: 132px; }.timestamp-start-row small { color: #8798ba; }.timestamp-start-row code { color: #c8d8f6; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
+.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { padding-top: 6px; padding-bottom: 9px; border-bottom: 1px solid #2b3855; }.timestamp-start-row label { white-space: nowrap; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-row .timestamp-start { width: 188px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
 </style>

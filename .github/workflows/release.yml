@@ -65,6 +65,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
+      - name: Cache Bundle Resource # rust cache始终不缓存这个，只能单独缓存了
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: src-tauri/target/.tauri
+          key: ffmpeg
+      - name: Test Cache (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          dir src-tauri/target/.tauri
       - name: setup node
         uses: actions/setup-node@v7
         with:
@@ -81,10 +93,15 @@ jobs:
       - name: install dependencies (ubuntu only)
         if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
         run: |
+            ls -all src-tauri/target || true
+            ls -all src-tauri/target/.tauri || true
             sudo apt update
             sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils zip
       - name: install frontend dependencies
         run: |
+          node -e "console.log(require('os').homedir())"
+          node -e "console.log(process.env.HOME)"
+          node -e "console.log(process.env.USERPROFILE)"
           npm install
       - name: Build
         uses: tauri-apps/tauri-action@v1
@@ -101,12 +118,14 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          ls -all src-tauri/target/.tauri || true
           ./src-tauri/target/release/mkv -v
 
       - name: Test Version (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          dir src-tauri/target/.tauri
           & .\src-tauri\target\release\mkv.exe -v
 
       - name: Create portable Linux ZIP
