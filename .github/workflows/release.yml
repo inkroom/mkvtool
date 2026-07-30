@@ -210,6 +210,12 @@ jobs:
           merge-multiple: true
           pattern: artifacts-*
           path: artifacts
+      - name: Download FFmpeg
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: ffmpeg*
+          path: artifacts
       - name: Delete Temp Release
         env:
           GH_TOKEN: ${{ github.token }}

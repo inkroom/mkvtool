@@ -134,17 +134,16 @@ impl SystemFfmpegService {
             fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
                 .map_err(|error| format!("无法设置 FFmpeg 执行权限：{error}"))?;
         }
+        let mut cmd = Command::new(destination);
 
-        if cfg!(target_os = "windows") {
+        #[cfg(target_os = "windows")]
+        {
             use std::os::windows::process::CommandExt;
-            let mut cmd = Command::new(destination);
             // 0x08000000 是 CREATE_NO_WINDOW 的标志值
             cmd.creation_flags(0x08000000);
             Ok(cmd)
-        } else {
-            Ok(Command::new(destination))
         }
-
+        Ok(cmd)
         // 侧车调用
         //  self.app
         //     .shell()
