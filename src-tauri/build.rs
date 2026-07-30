@@ -205,10 +205,9 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
 
 fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     let name = match target {
-        "x86_64-unknown-linux-gnu" => "ffmpeg-master-latest-linux64-gpl.tar.xz",
-        "aarch64-unknown-linux-gnu" => "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
-        "x86_64-apple-darwin" => "ffmpeg-master-latest-macos64-gpl.zip",
-        "aarch64-apple-darwin" => "ffmpeg-master-latest-macosarm64-gpl.zip",
+        "x86_64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linux64-gpl.tar.xz",
+        "aarch64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linuxarm64-gpl.tar.xz",
+        "x86_64-pc-windows-msvc" => "ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
         _ => return Err(format!("不支持的目标架构：{target}").into()),
     };
     Ok(name)

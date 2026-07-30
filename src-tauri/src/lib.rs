@@ -135,7 +135,15 @@ impl SystemFfmpegService {
                 .map_err(|error| format!("无法设置 FFmpeg 执行权限：{error}"))?;
         }
 
-        Ok(Command::new(destination))
+        if cfg!(target_os = "Windows") {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = Command::new(destination);
+            // 0x08000000 是 CREATE_NO_WINDOW 的标志值
+            cmd.creation_flags(0x08000000);
+            Ok(cmd)
+        } else {
+            Ok(Command::new(destination))
+        }
 
         // 侧车调用
         //  self.app
