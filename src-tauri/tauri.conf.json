@@ -17,6 +17,7 @@
         "height": 600,
         "center": true,
         "decorations": false,
+        "acceptFirstMouse": true,
         "backgroundColor": "#0d1220"
       }
     ],
