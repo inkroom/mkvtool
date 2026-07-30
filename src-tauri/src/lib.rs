@@ -135,7 +135,7 @@ impl SystemFfmpegService {
                 .map_err(|error| format!("无法设置 FFmpeg 执行权限：{error}"))?;
         }
 
-        if cfg!(target_os = "Windows") {
+        if cfg!(target_os = "windows") {
             use std::os::windows::process::CommandExt;
             let mut cmd = Command::new(destination);
             // 0x08000000 是 CREATE_NO_WINDOW 的标志值
