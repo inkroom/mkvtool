@@ -1,11 +1,12 @@
 use serde::Serialize;
 use std::{
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_shell::ShellExt;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,7 +60,7 @@ struct ProbeStream {
     disposition: Option<Disposition>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct StreamTags {
     title: Option<String>,
     language: Option<String>,
@@ -94,34 +95,71 @@ impl SystemFfmpegService {
     }
 
     fn sidecar_command(&self, sidecar: &str) -> Result<Command, String> {
-        self.app
-            .shell()
-            .sidecar(sidecar)
-            .map(Into::into)
-            .map_err(|error| format!("无法启动 FFmpeg sidecar：{error}"))
+
+        let executable_name = if cfg!(target_os = "windows") {
+           format!("{}.exe", sidecar)
+        } else {
+            sidecar.to_string()
+        };
+        let executable_dir = std::env::current_exe()
+            .map_err(|error| format!("无法获取当前可执行文件路径：{error}"))?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法获取当前可执行文件所在目录".to_string())?;
+        let destination = executable_dir.join(executable_name);
+
+        if !destination.is_file() {
+            let resource = self
+                .app
+                .path()
+                .resource_dir()
+                .map_err(|error| format!("无法定位 FFmpeg 资源目录：{error}"))?
+                .join("binaries")
+                .join(sidecar);
+
+            fs::copy(&resource, &destination).map_err(|error| {
+                format!(
+                    "无法释放 {} 资源 {} 到 {}：{error}",
+                    sidecar,
+                    resource.display(),
+                    destination.display()
+                )
+            })?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+                .map_err(|error| format!("无法设置 FFmpeg 执行权限：{error}"))?;
+        }
+
+        Ok(Command::new(destination))
+
+        // 侧车调用
+        //  self.app
+        //     .shell()
+        //     .sidecar(sidecar)
+        //     .map(Into::into)
+        //     .map_err(|error| format!("无法启动 FFmpeg sidecar：{error}"))
     }
 
     fn probe(&self, path: &Path) -> Result<ProbeResult, String> {
         let output = self
-            .sidecar_command("ffp")?
-            .args([
-                "-v",
-                "error",
-                "-show_format",
-                "-show_streams",
-                "-of",
-                "json",
-            ])
+            .sidecar_command("ffm")?
+            .args(["-hide_banner", "-i"])
             .arg(path)
             .output()
-            .map_err(|error| format!("无法启动 ffprobe，请确认已安装 FFmpeg：{error}"))?;
+            .map_err(|error| format!("无法启动 ffmpeg，请确认已安装 FFmpeg：{error}"))?;
 
-        if !output.status.success() {
-            return Err(command_error("ffprobe", &output.stderr));
+        // `ffmpeg -i` prints the input metadata then exits unsuccessfully because it has no output.
+        // A successfully parsed input description is therefore the success condition for probing.
+        if let Some(probe) = parse_ffmpeg_probe_output(&output.stderr) {
+            return Ok(probe);
         }
 
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("无法读取 ffprobe 的结果：{error}"))
+        Err(command_error("ffmpeg", &output.stderr))
     }
 
     fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static str)> {
@@ -152,6 +190,140 @@ impl SystemFfmpegService {
             return Err("目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流；图形字幕会保留但不可编辑。".to_string());
         }
         Ok(stream)
+    }
+}
+
+fn parse_ffmpeg_probe_output(stderr: &[u8]) -> Option<ProbeResult> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut format = None;
+    let mut streams = Vec::new();
+    let mut current_stream = None;
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if let Some(duration) = trimmed.strip_prefix("Duration: ") {
+            let duration = duration.split(',').next().unwrap_or_default().trim();
+            format = Some(ProbeFormat {
+                duration: ffmpeg_duration_seconds(duration),
+            });
+            continue;
+        }
+
+        if let Some(stream) = parse_ffmpeg_stream_line(trimmed) {
+            streams.push(stream);
+            current_stream = Some(streams.len() - 1);
+            continue;
+        }
+
+        let Some(stream_index) = current_stream else {
+            continue;
+        };
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "title" => streams[stream_index].tags.get_or_insert_with(Default::default).title = Some(value.to_string()),
+            "language" => streams[stream_index]
+                .tags
+                .get_or_insert_with(Default::default)
+                .language = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    (!streams.is_empty()).then_some(ProbeResult { streams, format })
+}
+
+fn parse_ffmpeg_stream_line(line: &str) -> Option<ProbeStream> {
+    let stream = line.strip_prefix("Stream #")?;
+    let (_, stream) = stream.split_once(':')?;
+    let index_end = stream.find(|character: char| !character.is_ascii_digit())?;
+    let index = stream[..index_end].parse().ok()?;
+    let remainder = &stream[index_end..];
+    let (stream_tags, description) = remainder.split_once(':')?;
+    let language = stream_tags
+        .rsplit_once('(')
+        .and_then(|(_, language)| language.strip_suffix(')'))
+        .filter(|language| !language.is_empty() && language.chars().all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_'))
+        .map(str::to_string);
+    let (codec_type, codec_description) = description.trim().split_once(':')?;
+    let codec_description = codec_description.trim();
+    let codec_name = codec_description
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .next()
+        .map(str::trim)
+        .filter(|codec| !codec.is_empty())
+        .map(str::to_string);
+
+    Some(ProbeStream {
+        index,
+        codec_type: ffmpeg_stream_type(codec_type.trim())?.to_string(),
+        codec_name,
+        codec_long_name: Some(codec_description.to_string()),
+        tags: language.map(|language| StreamTags {
+            title: None,
+            language: Some(language),
+        }),
+        disposition: Some(Disposition {
+            default: Some(line.contains("(default)").into()),
+            forced: Some(line.contains("(forced)").into()),
+        }),
+    })
+}
+
+fn ffmpeg_stream_type(value: &str) -> Option<&'static str> {
+    match value {
+        "Video" => Some("video"),
+        "Audio" => Some("audio"),
+        "Subtitle" => Some("subtitle"),
+        "Attachment" => Some("attachment"),
+        "Data" => Some("data"),
+        _ => None,
+    }
+}
+
+fn ffmpeg_duration_seconds(value: &str) -> Option<String> {
+    let mut parts = value.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((hours * 3600.0 + minutes * 60.0 + seconds).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ffmpeg_input_description() {
+        let output = br#"
+Input #0, matroska,webm, from 'sample.mkv':
+  Duration: 01:02:03.500, start: 0.000000, bitrate: 800 kb/s
+  Stream #0:0: Video: h264 (High), yuv420p
+  Stream #0:1(eng): Subtitle: ass (default) (forced)
+    Metadata:
+      title           : English subtitles
+"#;
+
+        let probe = parse_ffmpeg_probe_output(output).expect("FFmpeg output should parse");
+        assert_eq!(probe.format.and_then(|format| format.duration), Some("3723.5".to_string()));
+        assert_eq!(probe.streams.len(), 2);
+
+        let subtitle = &probe.streams[1];
+        assert_eq!(subtitle.index, 1);
+        assert_eq!(subtitle.codec_type, "subtitle");
+        assert_eq!(subtitle.codec_name.as_deref(), Some("ass"));
+        assert_eq!(subtitle.tags.as_ref().and_then(|tags| tags.language.as_deref()), Some("eng"));
+        assert_eq!(subtitle.tags.as_ref().and_then(|tags| tags.title.as_deref()), Some("English subtitles"));
+        assert_eq!(subtitle.disposition.as_ref().and_then(|value| value.default), Some(1));
+        assert_eq!(subtitle.disposition.as_ref().and_then(|value| value.forced), Some(1));
     }
 }
 
@@ -214,7 +386,7 @@ impl FfmpegService for SystemFfmpegService {
         }
 
         let content = String::from_utf8(output.stdout)
-            .map_err(|_| "字幕不是 UTF-8 文本，暂时无法在内存编辑器中打开。".to_string())?;
+            .map_err(|_| "字幕不是 UTF-8 文本，暂时无法在编辑器中打开。".to_string())?;
         Ok(SubtitleDocument {
             content,
             format: format.to_string(),
@@ -354,7 +526,6 @@ async fn save_subtitle(
 
 #[tauri::command]
 async fn pick_mkv_file(app: tauri::AppHandle) -> Option<String> {
-    println!("pick_mkv_file");
     app.dialog()
         .file()
         .add_filter("Matroska 视频", &["mkv"])

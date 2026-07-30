@@ -28,9 +28,8 @@
     "active": true,
     "useLocalToolsDir": true,
     "targets": "all",
-    "externalBin": [
-      "binaries/ffm",
-      "binaries/ffp"
+    "resources": [
+      "binaries/ffm"
     ],
     "icon": [
       "icons/32x32.png",

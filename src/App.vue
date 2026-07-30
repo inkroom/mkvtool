@@ -2,13 +2,14 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import mkvLogo from "./assets/mkv-logo.svg";
 
 const media = ref(null);
 const selectedStream = ref(null);
 const subtitle = ref(null);
 const subtitleContent = ref("");
 const timestampOffset = ref(500);
-const timestampStart = ref("");
+const timestampStart = ref({ hours: "00", minutes: "00", seconds: "00", milliseconds: "00" });
 const loading = ref(false);
 const saving = ref(false);
 const error = ref("");
@@ -177,11 +178,26 @@ function timestampMilliseconds(value) {
   );
 }
 
-function startTimestampMilliseconds(value) {
-  const match = value.match(/^(\d+):([0-5]\d):([0-5]\d)\.(\d{3})$/);
-  if (!match) return null;
-  const [, hours, minutes, seconds, milliseconds] = match;
+function startTimestampMilliseconds({ hours, minutes, seconds, milliseconds }) {
+  if (
+    !/^\d{1,}$/.test(hours) ||
+    !/^\d{1,2}$/.test(minutes) ||
+    !/^\d{1,2}$/.test(seconds) ||
+    !/^\d{1,3}$/.test(milliseconds) ||
+    Number(minutes) > 59 ||
+    Number(seconds) > 59
+  ) return null;
   return (Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds)) * 1000 + Number(milliseconds);
+}
+
+function normalizeTimestampStartPart(part, maxLength) {
+  const value = timestampStart.value[part].replace(/\D/g, "").slice(0, maxLength);
+  timestampStart.value[part] = value || "00";
+}
+
+function formatTimestampStart() {
+  const { hours, minutes, seconds, milliseconds } = timestampStart.value;
+  return `${hours.padStart(2, "0")}:${minutes.padStart(2, "0")}:${seconds.padStart(2, "0")}.${milliseconds.padStart(3, "0")}`;
 }
 
 function shiftTimestamp(value, milliseconds, separator = ".") {
@@ -202,10 +218,9 @@ function shiftTimestamp(value, milliseconds, separator = ".") {
 function shiftSubtitles(direction) {
   const milliseconds = Math.round(Number(timestampOffset.value) * direction);
   if (!Number.isFinite(milliseconds) || milliseconds === 0 || !subtitle.value) return;
-  const startValue = timestampStart.value.trim();
-  const startMilliseconds = startValue ? startTimestampMilliseconds(startValue) : null;
-  if (startValue && startMilliseconds === null) {
-    showError("起始时间格式无效，请输入 0:00:00.000。");
+  const startMilliseconds = startTimestampMilliseconds(timestampStart.value);
+  if (startMilliseconds === null) {
+    showError("起始时间无效，请检查分、秒和毫秒。");
     return;
   }
   if (subtitle.value.format === "ass") {
@@ -213,7 +228,7 @@ function shiftSubtitles(direction) {
       const values = fields.split(",");
       if (values.length < 3) return line;
       const lineStart = timestampMilliseconds(values[1]);
-      if (lineStart === null || (startMilliseconds !== null && lineStart < startMilliseconds)) return line;
+      if (lineStart === null || lineStart < startMilliseconds) return line;
       values[1] = shiftTimestamp(values[1].trim(), milliseconds, ".").replace(/^0(?=\d:)/, "");
       values[2] = shiftTimestamp(values[2].trim(), milliseconds, ".").replace(/^0(?=\d:)/, "");
       return `Dialogue: ${values.join(",")}`;
@@ -223,12 +238,12 @@ function shiftSubtitles(direction) {
       /(\d{2,}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[,.]\d{3})/g,
       (_, start, end) => {
         const lineStart = timestampMilliseconds(start);
-        if (lineStart === null || (startMilliseconds !== null && lineStart < startMilliseconds)) return `${start} --> ${end}`;
+        if (lineStart === null || lineStart < startMilliseconds) return `${start} --> ${end}`;
         return `${shiftTimestamp(start, milliseconds, start.includes(",") ? "," : ".")} --> ${shiftTimestamp(end, milliseconds, end.includes(",") ? "," : ".")}`;
       },
     );
   }
-  notice.value = `已将${startValue ? `${startValue} 起的` : "当前"}字幕${milliseconds > 0 ? "推迟" : "提前"} ${Math.abs(milliseconds)} ms。`;
+  notice.value = `已将 ${formatTimestampStart()} 起的字幕${milliseconds > 0 ? "推迟" : "提前"} ${Math.abs(milliseconds)} ms。`;
 }
 
 onMounted(async () => {
@@ -244,6 +259,7 @@ onBeforeUnmount(() => unlistenDrop?.());
   <main class="app-shell">
     <div class="window-bar" :class="{ 'macos-window-bar': isMacOS }" @selectstart.prevent @dragstart.prevent>
       <div class="window-drag-area" data-tauri-drag-region aria-hidden="true"></div>
+      <img v-if="!isMacOS" class="window-logo" :src="mkvLogo" alt="" aria-hidden="true" />
       <span class="window-title">MKV 字幕工作台</span>
       <div class="window-controls" @mousedown.stop>
         <template v-if="isMacOS">
@@ -268,7 +284,7 @@ onBeforeUnmount(() => unlistenDrop?.());
     <section v-if="!media" class="drop-zone" @click="chooseFile">
       <div class="drop-icon">↓</div>
       <h2>拖放 MKV 文件到这里</h2>
-      <p>或点击此处打开文件选择框。文件会先由 FFprobe 分析，所有流（包括附件）均会显示。</p>
+      <p>或点击此处打开文件选择框</p>
     </section>
 
     <p v-if="error" class="message error">{{ error }}</p>
@@ -280,7 +296,7 @@ onBeforeUnmount(() => unlistenDrop?.());
     <section v-if="media" class="workspace">
       <aside class="sidebar">
         <div class="file-summary">
-          <span class="file-badge">MKV</span>
+          <img class="file-logo" :src="mkvLogo" alt="MKV" />
           <div>
             <strong :title="media.name" :aria-label="media.name">{{ media.name }}</strong>
             <div class="file-details">
@@ -337,8 +353,16 @@ onBeforeUnmount(() => unlistenDrop?.());
             <button @click="shiftSubtitles(1)">推迟</button>
           </div>
           <div class="timestamp-start-row">
-            <label for="timestamp-start">起始时间</label>
-            <input id="timestamp-start" v-model="timestampStart" class="timestamp-start" placeholder="0:00:00.000（留空处理全部）" aria-label="时间轴偏移起始时间" />
+            <span class="timestamp-start-label">起始时间</span>
+            <div class="timestamp-start-inputs" aria-label="时间轴偏移起始时间">
+              <input v-model="timestampStart.hours" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间小时" @input="normalizeTimestampStartPart('hours', 2)" />
+              <span>:</span>
+              <input v-model="timestampStart.minutes" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间分钟" @input="normalizeTimestampStartPart('minutes', 2)" />
+              <span>:</span>
+              <input v-model="timestampStart.seconds" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间秒" @input="normalizeTimestampStartPart('seconds', 2)" />
+              <span>.</span>
+              <input v-model="timestampStart.milliseconds" class="timestamp-start milliseconds" inputmode="numeric" maxlength="3" aria-label="起始时间毫秒" @input="normalizeTimestampStartPart('milliseconds', 3)" />
+            </div>
           </div>
           <textarea v-model="subtitleContent" spellcheck="false" aria-label="字幕内容" />
         </template>
@@ -353,7 +377,7 @@ onBeforeUnmount(() => unlistenDrop?.());
           </template>
           <template v-else>
             <h2>选择一个字幕流开始编辑</h2>
-            <p>选择左侧标有“可编辑”的字幕流。编辑内容始终保存在内存中，直到你导出文件。</p>
+            <p>选择左侧标有“可编辑”的字幕流。</p>
           </template>
         </div>
       </section>
@@ -378,7 +402,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .loading-overlay { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 24px; background: #080d18bd; backdrop-filter: blur(3px); }
 .loading-card { display: grid; justify-items: center; gap: 13px; min-width: 300px; padding: 28px 32px; border: 1px solid #405c91; border-radius: 14px; color: #edf3ff; background: #14213ad9; box-shadow: 0 20px 60px #0008; text-align: center; }.loading-card small { color: #aebcd5; }.loading-spinner { width: 34px; height: 34px; border: 4px solid #7fe2b744; border-top-color: #7fe2b7; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 .app-shell { width: 100%; height: 100vh; min-height: 0; display: flex; flex-direction: column; }
-.window-bar { position: relative; z-index: 11; height: 34px; flex: 0 0 34px; display: flex; align-items: center; border-bottom: 1px solid #283650; color: #aebbd4; background: #101827; user-select: none; -webkit-user-select: none; }.window-drag-area { position: absolute; inset: 0; }.window-title { position: absolute; z-index: 1; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: .72rem; font-weight: 700; }.window-controls { z-index: 2; align-self: stretch; display: flex; margin-left: auto; }.window-control { width: 42px; height: 34px; display: grid; place-items: center; padding: 0; border: 0; color: #cbd7ec; background: transparent; font-size: 1.05rem; line-height: 1; }.window-control:hover { background: #25344f; }.close-window:hover { color: #fff; background: #bf3944; }.macos-window-bar .window-controls { align-items: center; gap: 8px; margin-right: auto; margin-left: 0; padding: 0 12px; }.macos-window-bar .window-control { width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; border-radius: 50%; color: transparent; font-size: .68rem; font-weight: 800; line-height: 12px; }.macos-window-bar .window-control span { display: block; height: 12px; line-height: 11px; transform: translateY(-.5px); }.macos-window-bar .close-window { background: #ff5f57; }.macos-window-bar .minimize-window { background: #febc2e; }.macos-window-bar .window-control:hover { color: #4d3220; }.macos-window-bar .close-window:hover { background: #ff5f57; }.macos-window-bar .minimize-window:hover { background: #febc2e; }
+.window-bar { position: relative; z-index: 11; height: 34px; flex: 0 0 34px; display: flex; align-items: center; border-bottom: 1px solid #283650; color: #aebbd4; background: #101827; user-select: none; -webkit-user-select: none; }.window-drag-area { position: absolute; inset: 0; }.window-logo { position: relative; z-index: 1; width: 20px; height: 20px; margin-left: 9px; object-fit: contain; pointer-events: none; }.window-title { position: absolute; z-index: 1; inset: 0; display: grid; place-items: center; pointer-events: none; font-size: .72rem; font-weight: 700; }.window-controls { z-index: 2; align-self: stretch; display: flex; margin-left: auto; }.window-control { width: 42px; height: 34px; display: grid; place-items: center; padding: 0; border: 0; color: #cbd7ec; background: transparent; font-size: 1.05rem; line-height: 1; }.window-control:hover { background: #25344f; }.close-window:hover { color: #fff; background: #bf3944; }.macos-window-bar .window-controls { align-items: center; gap: 8px; margin-right: auto; margin-left: 0; padding: 0 12px; }.macos-window-bar .window-control { width: 12px; height: 12px; display: flex; align-items: center; justify-content: center; border-radius: 50%; color: transparent; font-size: .68rem; font-weight: 800; line-height: 12px; }.macos-window-bar .window-control span { display: block; height: 12px; line-height: 11px; transform: translateY(-.5px); }.macos-window-bar .close-window { background: #ff5f57; }.macos-window-bar .minimize-window { background: #febc2e; }.macos-window-bar .window-control:hover { color: #4d3220; }.macos-window-bar .close-window:hover { background: #ff5f57; }.macos-window-bar .minimize-window:hover { background: #febc2e; }
 .editor-header, .file-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .eyebrow { color: #75a7ff; font-size: .71rem; letter-spacing: .16em; font-weight: 800; margin: 0 0 4px; }
 h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
@@ -388,7 +412,7 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .drop-icon { width: 46px; height: 46px; display: grid; place-items: center; margin: 0 auto 18px; border-radius: 50%; font-size: 1.8rem; background: #24375c; color: #7fe2b7; }
 .message { margin: 0; padding: 10px 13px; border-radius: 0; white-space: pre-wrap; }.error { color: #ffc6c6; background: #4b202b; }.notice { position: fixed; z-index: 9; top: 46px; right: 18px; display: flex; align-items: center; gap: 12px; max-width: min(440px, calc(100vw - 36px)); padding: 10px 10px 10px 14px; border: 1px solid #368568; border-radius: 8px; color: #b7f6d7; background: #173d35; box-shadow: 0 12px 32px #0006; }.notice-close { width: 24px; height: 24px; flex: 0 0 24px; padding: 0; border: 0; border-radius: 5px; color: #d5ffe8; background: transparent; font-size: 1.2rem; line-height: 1; }.notice-close:hover { background: #28604f; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
-.sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }.file-badge { padding: 7px 5px; border-radius: 5px; color: #0c1b2d; background: #7fe2b7; font-size: .68rem; font-weight: 900; }
+.sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-logo { width: 34px; height: 34px; flex: 0 0 34px; object-fit: contain; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }
 .stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; }.stream-row:hover { background: #1a2740; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
-.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { padding-top: 6px; padding-bottom: 9px; border-bottom: 1px solid #2b3855; }.timestamp-start-row label { white-space: nowrap; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-row .timestamp-start { width: 188px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
+.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { padding-top: 6px; padding-bottom: 9px; border-bottom: 1px solid #2b3855; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; align-items: center; gap: 3px; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
 </style>

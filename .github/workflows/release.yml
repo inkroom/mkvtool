@@ -71,12 +71,6 @@ jobs:
         with:
           path: src-tauri/target/.tauri
           key: bundle-${{runner.os}}
-      - name: Test Cache (Windows)
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          dir src-tauri/target/.tauri
       - name: setup node
         uses: actions/setup-node@v7
         with:
@@ -93,15 +87,10 @@ jobs:
       - name: install dependencies (ubuntu only)
         if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
         run: |
-            ls -all src-tauri/target || true
-            ls -all src-tauri/target/.tauri || true
             sudo apt update
             sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils zip
       - name: install frontend dependencies
         run: |
-          node -e "console.log(require('os').homedir())"
-          node -e "console.log(process.env.HOME)"
-          node -e "console.log(process.env.USERPROFILE)"
           npm install
       - name: Build
         uses: tauri-apps/tauri-action@v1
@@ -118,14 +107,12 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ls -all src-tauri/target/.tauri || true
           ./src-tauri/target/release/mkv -v
 
       - name: Test Version (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          dir src-tauri/target/.tauri
           & .\src-tauri\target\release\mkv.exe -v
 
       - name: Create portable Linux ZIP
@@ -182,16 +169,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
             new_tag=$(date +%Y%m%d)
-            now_tag=$(curl -sSf https://api.github.com/repos/${{github.repository}}/releases/latest | jq --raw-output '.tag_name')
+            now_tag=$(curl -sSf https://api.github.com/repos/${{ github.repository}}/releases/latest | jq --raw-output '.tag_name')
             if [[ "$new_tag" = "$now_tag" ]]; then
               echo "delete $now_tag"
               gh release delete $now_tag
-              now_tag=$(curl -sSf https://api.github.com/repos/${{github.repository}}/releases | jq --raw-output '.[0].tag_name')
+              now_tag=$(curl -sSf https://api.github.com/repos/${{ github.repository}}/releases | jq --raw-output '.[0].tag_name')
             fi
             commit=$(git rev-list -n 1 $now_tag || echo "null")
             echo "$commit"
 
-            if gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" /repos/${{ github.repository }}/tags | jq -e --arg tag "$new_tag" 'any(.[]; .name == $tag)' > /dev/null; then
+            if gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" /repos/${{ github.repository }}/tags | jq -e --arg tag "$new_tag" 'any(.[]; .name == $tag)' > /dev/null; then 
                 echo "delete remote tag $new_tag"
                 git push origin --delete $new_tag
                 git tag -d $new_tag || true
@@ -205,13 +192,18 @@ jobs:
             if [[ "$commit" != "null" ]]; then
               msg=$(git --no-pager log --pretty=format:"- [%s](https://github.com/${{ github.repository}}/commit/%H)" $commit..HEAD)
             fi
-            echo "$msg" > body.md
-            echo "body=$msg" >> $GITHUB_OUTPUT
-            
+
+            cat << 'EOF' > body.md
+              安装dmg后需要执行以下命令，否则会提示包已损坏
+              ```shell
+              sudo xattr -rd com.apple.quarantine /Applications/mkv.app
+              ```
+            EOF
+            echo "" >> body.md
+            echo "$msg" >> body.md
             echo "tag=$new_tag" >> $GITHUB_OUTPUT
             # 如果直接指向master，release会落后一个commit
             # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
-
       - name: Download Artifacts
         uses: actions/download-artifact@v8
         with:

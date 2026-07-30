@@ -19,7 +19,22 @@ fn main() {
     } else {
         download_sidecars().unwrap_or_else(|error| panic!("无法准备 FFmpeg sidecar：{error}"));
     }
+    copy_resource().unwrap_or_else(|error| panic!("copy ffmpeg fail：{error}"));
     tauri_build::build();
+}
+
+fn copy_resource()-> Result<(), Box<dyn std::error::Error>>{
+        // ffmpeg 作为资源文件 而非侧车进程的处理逻辑
+    let target = env::var("TARGET")?;
+    let extension = if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let binaries_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("binaries");
+    let ffmpeg = binaries_dir.join(format!("ffm-{target}{extension}"));
+    fs::copy(ffmpeg, &binaries_dir.join(format!("ffm")))?;
+    Ok(())
 }
 
 fn inject_build_metadata() {
