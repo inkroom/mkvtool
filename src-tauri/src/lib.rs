@@ -141,7 +141,6 @@ impl SystemFfmpegService {
             use std::os::windows::process::CommandExt;
             // 0x08000000 是 CREATE_NO_WINDOW 的标志值
             cmd.creation_flags(0x08000000);
-            Ok(cmd)
         }
         Ok(cmd)
         // 侧车调用
