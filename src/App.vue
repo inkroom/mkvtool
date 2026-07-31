@@ -1,13 +1,13 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import mkvLogo from "./assets/mkv-logo.svg";
+import { getCurrentWindow, invoke } from "./platform";
+
+const mkvLogo = "/mkv-logo.svg";
 
 const media = ref(null);
 const selectedStream = ref(null);
-const subtitle = ref(null);
-const subtitleContent = ref("");
+const editorTabs = ref([]);
+const activeTabId = ref(null);
 const timestampOffset = ref(500);
 const timestampStart = ref({ hours: "00", minutes: "00", seconds: "00", milliseconds: "00" });
 const loading = ref(false);
@@ -20,6 +20,9 @@ const languageNames = typeof Intl.DisplayNames === "function"
   : null;
 
 let unlistenDrop;
+let subtitleTabsElement;
+let subtitleTabsScrollFrame;
+let subtitleTabsScrollTarget;
 
 const streamGroups = computed(() => {
   const groups = { video: [], audio: [], subtitle: [], attachment: [], other: [] };
@@ -45,6 +48,17 @@ const busyMessage = computed(() => {
   return "正在分析 MKV 文件，请稍候…";
 });
 
+const activeTab = computed(() => editorTabs.value.find((tab) => tab.stream.index === activeTabId.value) ?? null);
+const subtitle = computed(() => activeTab.value?.subtitle ?? null);
+const subtitleContent = computed({
+  get: () => activeTab.value?.content ?? "",
+  set: (content) => {
+    if (!activeTab.value) return;
+    activeTab.value.content = content;
+    activeTab.value.dirty = content !== activeTab.value.originalContent;
+  },
+});
+
 function showError(message) {
   error.value = typeof message === "string" ? message : String(message);
   notice.value = "";
@@ -56,8 +70,8 @@ async function loadFile(path) {
   error.value = "";
   notice.value = "";
   selectedStream.value = null;
-  subtitle.value = null;
-  subtitleContent.value = "";
+  editorTabs.value = [];
+  activeTabId.value = null;
   try {
     media.value = await invoke("inspect_mkv", { path });
   } catch (reason) {
@@ -87,17 +101,34 @@ async function closeWindow() {
 
 async function selectStream(stream) {
   selectedStream.value = stream;
-  subtitle.value = null;
-  subtitleContent.value = "";
   error.value = "";
   if (!stream.editable) return;
+  const existingTab = editorTabs.value.find((tab) => tab.stream.index === stream.index);
+  if (existingTab) {
+    activeTabId.value = existingTab.stream.index;
+    return;
+  }
+
   loading.value = true;
   try {
-    subtitle.value = await invoke("read_subtitle", {
+    const document = await invoke("read_subtitle", {
       path: media.value.path,
       streamIndex: stream.index,
     });
-    subtitleContent.value = subtitle.value.content;
+    const tab = {
+      stream,
+      subtitle: document,
+      originalContent: document.content,
+      content: document.content,
+      dirty: false,
+    };
+    const replaceIndex = editorTabs.value.findIndex((candidate) => !candidate.dirty);
+    if (replaceIndex >= 0) {
+      editorTabs.value.splice(replaceIndex, 1, tab);
+    } else {
+      editorTabs.value.push(tab);
+    }
+    activeTabId.value = stream.index;
   } catch (reason) {
     showError(reason);
   } finally {
@@ -105,20 +136,63 @@ async function selectStream(stream) {
   }
 }
 
+function activateTab(tab) {
+  selectedStream.value = tab.stream;
+  activeTabId.value = tab.stream.index;
+  error.value = "";
+}
+
+function scrollSubtitleTabs(event) {
+  subtitleTabsElement = event.currentTarget;
+  const delta = event.deltaX || event.deltaY;
+  const multiplier = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? subtitleTabsElement.clientWidth : 1;
+  const maximum = subtitleTabsElement.scrollWidth - subtitleTabsElement.clientWidth;
+  subtitleTabsScrollTarget = Math.min(
+    maximum,
+    Math.max(0, (subtitleTabsScrollTarget ?? subtitleTabsElement.scrollLeft) + delta * multiplier),
+  );
+  if (subtitleTabsScrollFrame) return;
+
+  const animate = () => {
+    const distance = subtitleTabsScrollTarget - subtitleTabsElement.scrollLeft;
+    if (Math.abs(distance) < 0.5) {
+      subtitleTabsElement.scrollLeft = subtitleTabsScrollTarget;
+      subtitleTabsScrollFrame = undefined;
+      subtitleTabsScrollTarget = undefined;
+      return;
+    }
+    subtitleTabsElement.scrollLeft += distance * 0.22;
+    subtitleTabsScrollFrame = requestAnimationFrame(animate);
+  };
+  subtitleTabsScrollFrame = requestAnimationFrame(animate);
+}
+
 async function saveSubtitle() {
-  if (!media.value || !selectedStream.value || !subtitle.value) return;
+  if (!media.value) return;
+  const edits = editorTabs.value
+    .filter((tab) => tab.dirty)
+    .map((tab) => ({ streamIndex: tab.stream.index, content: tab.content }));
+  if (!edits.length) {
+    showError("没有需要导出的字幕修改。");
+    return;
+  }
   try {
     const defaultName = media.value.name.replace(/\.mkv$/i, "") + "-edited.mkv";
     const outputPath = await invoke("pick_output_file", { suggestedName: defaultName });
     if (!outputPath) return;
     saving.value = true;
     error.value = "";
-    await invoke("save_subtitle", {
+    await invoke("save_subtitles", {
       inputPath: media.value.path,
       outputPath,
-      streamIndex: selectedStream.value.index,
-      content: subtitleContent.value,
+      edits,
     });
+    for (const tab of editorTabs.value) {
+      if (tab.dirty) {
+        tab.originalContent = tab.content;
+        tab.dirty = false;
+      }
+    }
     notice.value = `已输出：${outputPath}`;
   } catch (reason) {
     showError(reason);
@@ -252,7 +326,10 @@ onMounted(async () => {
   });
 });
 
-onBeforeUnmount(() => unlistenDrop?.());
+onBeforeUnmount(() => {
+  unlistenDrop?.();
+  if (subtitleTabsScrollFrame) cancelAnimationFrame(subtitleTabsScrollFrame);
+});
 </script>
 
 <template>
@@ -353,15 +430,31 @@ onBeforeUnmount(() => unlistenDrop?.());
             <button @click="shiftSubtitles(1)">推迟</button>
           </div>
           <div class="timestamp-start-row">
-            <span class="timestamp-start-label">起始时间</span>
-            <div class="timestamp-start-inputs" aria-label="时间轴偏移起始时间">
-              <input v-model="timestampStart.hours" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间小时" @input="normalizeTimestampStartPart('hours', 2)" />
-              <span>:</span>
-              <input v-model="timestampStart.minutes" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间分钟" @input="normalizeTimestampStartPart('minutes', 2)" />
-              <span>:</span>
-              <input v-model="timestampStart.seconds" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间秒" @input="normalizeTimestampStartPart('seconds', 2)" />
-              <span>.</span>
-              <input v-model="timestampStart.milliseconds" class="timestamp-start milliseconds" inputmode="numeric" maxlength="3" aria-label="起始时间毫秒" @input="normalizeTimestampStartPart('milliseconds', 3)" />
+            <div class="timestamp-start-controls">
+              <span class="timestamp-start-label">起始时间</span>
+              <div class="timestamp-start-inputs" aria-label="时间轴偏移起始时间">
+                <input v-model="timestampStart.hours" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间小时" @input="normalizeTimestampStartPart('hours', 2)" />
+                <span>:</span>
+                <input v-model="timestampStart.minutes" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间分钟" @input="normalizeTimestampStartPart('minutes', 2)" />
+                <span>:</span>
+                <input v-model="timestampStart.seconds" class="timestamp-start" inputmode="numeric" maxlength="2" aria-label="起始时间秒" @input="normalizeTimestampStartPart('seconds', 2)" />
+                <span>.</span>
+                <input v-model="timestampStart.milliseconds" class="timestamp-start milliseconds" inputmode="numeric" maxlength="3" aria-label="起始时间毫秒" @input="normalizeTimestampStartPart('milliseconds', 3)" />
+              </div>
+            </div>
+            <div class="subtitle-tabs" role="tablist" aria-label="已打开的字幕" @wheel.prevent="scrollSubtitleTabs">
+              <button
+                v-for="tab in editorTabs"
+                :key="tab.stream.index"
+                class="subtitle-tab"
+                :class="{ active: activeTabId === tab.stream.index, dirty: tab.dirty }"
+                type="button"
+                role="tab"
+                :aria-selected="activeTabId === tab.stream.index"
+                @click="activateTab(tab)"
+              >
+                {{ streamLabel(tab.stream) }}<span v-if="tab.dirty" aria-label="已编辑">*</span>
+              </button>
             </div>
           </div>
           <textarea v-model="subtitleContent" spellcheck="false" aria-label="字幕内容" />
@@ -414,5 +507,13 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
 .sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-logo { width: 34px; height: 34px; flex: 0 0 34px; object-fit: contain; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }
 .stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; }.stream-row:hover { background: #1a2740; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
-.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { padding-top: 6px; padding-bottom: 9px; border-bottom: 1px solid #2b3855; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; align-items: center; gap: 3px; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
+.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { min-width: 0; align-items: flex-end; padding-top: 6px; padding-bottom: 0; border-bottom: 1px solid #2b3855; }.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 9px; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }.subtitle-tabs { align-self: stretch; min-width: 0; display: flex; flex: 1; align-items: flex-end; gap: 0; overflow-x: auto; scrollbar-width: none; }.subtitle-tabs::-webkit-scrollbar { display: none; }.subtitle-tab { position: relative; z-index: 0; flex: 0 0 auto; max-width: 132px; margin: 0 0 -1px -1px; overflow: hidden; border: 1px solid #33486e; border-bottom-color: #2b3855; border-radius: 5px 5px 0 0; padding: 7px 9px 8px; color: #9eafcf; background: #18243a; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }.subtitle-tab:first-child { margin-left: 0; }.subtitle-tab:hover { z-index: 1; border-color: #536987; color: #dbe7ff; background: #223451; }.subtitle-tab.active { z-index: 2; border-color: #6d92d6; border-bottom: 0; padding-bottom: 9px; color: #edf3ff; background: #101827; }.subtitle-tab.dirty { color: #d8f1a6; }.subtitle-tab span { margin-left: 3px; color: #7fe2b7; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
+.timestamp-start-row { border-bottom: 0; }
+.timestamp-start-row { position: relative; gap: 8px; }
+.timestamp-start-controls { position: relative; align-self: stretch; display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+.timestamp-start-controls::after { position: absolute; right: -8px; bottom: 0; left: -24px; content: ""; border-bottom: 1px solid #2b3855; }
+.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 0; }
+.subtitle-tabs { overflow-y: hidden; }
+.subtitle-tabs::after { content: ""; flex: 1 0 0; align-self: flex-end; border-bottom: 1px solid #2b3855; }
+.subtitle-tab { margin-bottom: 0; }
 </style>

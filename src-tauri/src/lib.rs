@@ -1,11 +1,18 @@
 use serde::Serialize;
 use std::{
+    collections::{HashMap, HashSet},
     fs,
-    io::Write,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
-use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 #[derive(Debug, Serialize)]
@@ -37,6 +44,92 @@ struct SubtitleDocument {
     content: String,
     format: String,
     codec_name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleEdit {
+    stream_index: u32,
+    content: String,
+}
+
+struct SubtitleServer {
+    base_url: String,
+    running: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SubtitleServer {
+    fn start(edits: &[SubtitleEdit]) -> Result<Self, String> {
+        let sources = edits
+            .iter()
+            .map(|edit| (format!("/{}", edit.stream_index), edit.content.clone()))
+            .collect::<HashMap<_, _>>();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("无法创建内存字幕输入：{error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("无法配置内存字幕输入：{error}"))?;
+        let base_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .map_err(|error| format!("无法读取内存字幕输入地址：{error}"))?
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = Arc::clone(&running);
+        let thread = thread::Builder::new()
+            .name("subtitle-input-server".to_string())
+            .spawn(move || {
+                while thread_running.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            let mut request = [0_u8; 2048];
+                            let path = socket
+                                .read(&mut request)
+                                .ok()
+                                .and_then(|length| std::str::from_utf8(&request[..length]).ok())
+                                .and_then(|request| request.lines().next())
+                                .and_then(|request_line| request_line.split_whitespace().nth(1));
+                            let content = path.and_then(|path| sources.get(path));
+                            let response = match content {
+                                Some(content) => format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    content.len(),
+                                    content
+                                ),
+                                None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                            };
+                            let _ = socket.write_all(response.as_bytes());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|error| format!("无法启动内存字幕输入：{error}"))?;
+
+        Ok(Self {
+            base_url,
+            running,
+            thread: Some(thread),
+        })
+    }
+
+    fn url(&self, stream_index: u32) -> String {
+        format!("{}/{stream_index}", self.base_url)
+    }
+}
+
+impl Drop for SubtitleServer {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -75,26 +168,26 @@ struct Disposition {
 trait FfmpegService: Send + Sync {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String>;
     fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String>;
-    fn remux_subtitle(
+    fn remux_subtitles(
         &self,
         input: &Path,
         output: &Path,
-        stream_index: u32,
-        content: &str,
+        edits: &[SubtitleEdit],
     ) -> Result<(), String>;
 }
 
 #[derive(Clone)]
-struct SystemFfmpegService {
-    app: tauri::AppHandle,
-}
+struct SystemFfmpegService;
 
 impl SystemFfmpegService {
-    fn new(app: tauri::AppHandle) -> Self {
-        Self { app }
+    fn new(_app: tauri::AppHandle) -> Self {
+        Self
     }
 
     fn sidecar_command(&self, sidecar: &str) -> Result<Command, String> {
+        if sidecar != "ffm" {
+            return Err(format!("不支持的内嵌命令：{sidecar}"));
+        }
 
         let executable_name = if cfg!(target_os = "windows") {
            format!("{}.exe", sidecar)
@@ -109,19 +202,10 @@ impl SystemFfmpegService {
         let destination = executable_dir.join(executable_name);
 
         if !destination.is_file() {
-            let resource = self
-                .app
-                .path()
-                .resource_dir()
-                .map_err(|error| format!("无法定位 FFmpeg 资源目录：{error}"))?
-                .join("binaries")
-                .join(sidecar);
-
-            fs::copy(&resource, &destination).map_err(|error| {
+            fs::write(&destination, include_bytes!("../binaries/ffm")).map_err(|error| {
                 format!(
-                    "无法释放 {} 资源 {} 到 {}：{error}",
+                    "无法释放内嵌 {} 到 {}：{error}",
                     sidecar,
-                    resource.display(),
                     destination.display()
                 )
             })?;
@@ -134,7 +218,10 @@ impl SystemFfmpegService {
             fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
                 .map_err(|error| format!("无法设置 FFmpeg 执行权限：{error}"))?;
         }
+        #[cfg(target_os = "windows")]
         let mut cmd = Command::new(destination);
+        #[cfg(not(target_os = "windows"))]
+        let cmd = Command::new(destination);
 
         #[cfg(target_os = "windows")]
         {
@@ -143,12 +230,6 @@ impl SystemFfmpegService {
             cmd.creation_flags(0x08000000);
         }
         Ok(cmd)
-        // 侧车调用
-        //  self.app
-        //     .shell()
-        //     .sidecar(sidecar)
-        //     .map(Into::into)
-        //     .map_err(|error| format!("无法启动 FFmpeg sidecar：{error}"))
     }
 
     fn probe(&self, path: &Path) -> Result<ProbeResult, String> {
@@ -400,29 +481,50 @@ impl FfmpegService for SystemFfmpegService {
         })
     }
 
-    fn remux_subtitle(
+    fn remux_subtitles(
         &self,
         input: &Path,
         output: &Path,
-        stream_index: u32,
-        content: &str,
+        edits: &[SubtitleEdit],
     ) -> Result<(), String> {
+        if edits.is_empty() {
+            return Err("没有需要导出的字幕修改。".to_string());
+        }
+
         let probe = self.probe(input)?;
-        let stream = self.editable_stream(&probe, stream_index)?;
-        let codec_name = stream.codec_name.as_deref().unwrap_or_default();
-        let (format, _) = Self::subtitle_specification(codec_name).unwrap();
+        let mut edited_streams = HashSet::new();
+        let mut formats = Vec::with_capacity(edits.len());
+        for edit in edits {
+            if !edited_streams.insert(edit.stream_index) {
+                return Err(format!("字幕流 #{} 被重复提交。", edit.stream_index));
+            }
+            let stream = self.editable_stream(&probe, edit.stream_index)?;
+            let codec_name = stream.codec_name.as_deref().unwrap_or_default();
+            let (format, _) = Self::subtitle_specification(codec_name).unwrap();
+            formats.push(format);
+        }
+
+        let subtitle_server = SubtitleServer::start(edits)?;
 
         let mut command = self.sidecar_command("ffm")?;
         command
             .args(["-v", "error",  "-i"])
-            .arg(input)
-            .args(["-f", format, "-i", "pipe:0"]);
+            .arg(input);
+        for (edit, format) in edits.iter().zip(formats) {
+            command
+                .args(["-f", format, "-i"])
+                .arg(subtitle_server.url(edit.stream_index));
+        }
 
-        // Map each source stream in its original order, replacing only the edited subtitle.
+        // Keep each source stream in its original order, replacing edited subtitle streams in place.
         for candidate in &probe.streams {
             command.arg("-map");
-            if candidate.index == stream_index {
-                command.arg("1:0");
+            if let Some((input_index, _)) = edits
+                .iter()
+                .enumerate()
+                .find(|(_, edit)| edit.stream_index == candidate.index)
+            {
+                command.arg(format!("{}:0", input_index + 1));
             } else {
                 command.arg(format!("0:{}", candidate.index));
             }
@@ -439,22 +541,12 @@ impl FfmpegService for SystemFfmpegService {
             .args(["-map_chapters", "0", "-c", "copy"])
             .arg("-y")
             .arg(output)
-            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let mut child = command
-            .spawn()
+        let output_result = command
+            .output()
             .map_err(|error| format!("无法启动 ffmpeg，请确认已安装 FFmpeg：{error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "无法向 ffmpeg 写入内存字幕。".to_string())?
-            .write_all(content.as_bytes())
-            .map_err(|error| format!("写入字幕数据失败：{error}"))?;
-        let output_result = child
-            .wait_with_output()
-            .map_err(|error| format!("等待 ffmpeg 完成时出错：{error}"))?;
 
         if !output_result.status.success() {
             return Err(command_error("ffmpeg", &output_result.stderr));
@@ -510,12 +602,11 @@ async fn read_subtitle(
 }
 
 #[tauri::command]
-async fn save_subtitle(
+async fn save_subtitles(
     app: tauri::AppHandle,
     input_path: String,
     output_path: String,
-    stream_index: u32,
-    content: String,
+    edits: Vec<SubtitleEdit>,
 ) -> Result<(), String> {
     let input = mkv_path(&input_path)?;
     let output = PathBuf::from(output_path);
@@ -523,9 +614,7 @@ async fn save_subtitle(
         return Err("输出文件必须使用 .mkv 扩展名。".to_string());
     }
     let service = SystemFfmpegService::new(app);
-    tauri::async_runtime::spawn_blocking(move || {
-        service.remux_subtitle(&input, &output, stream_index, &content)
-    })
+    tauri::async_runtime::spawn_blocking(move || service.remux_subtitles(&input, &output, &edits))
     .await
     .map_err(|error| format!("重新混流时出错：{error}"))?
 }
@@ -560,7 +649,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             inspect_mkv,
             read_subtitle,
-            save_subtitle,
+            save_subtitles,
             pick_mkv_file,
             pick_output_file
         ])

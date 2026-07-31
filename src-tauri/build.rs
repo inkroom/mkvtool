@@ -6,7 +6,7 @@ use std::{
     process::Command,
 };
 
-const RELEASE_URL: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download";
+const RELEASE_URL: &str = "https://github.com/inkroom/mkvtool/releases/download/resource/";
 const FFMPEG_SOURCE_URL: &str = "https://github.com/ffmpeg/ffmpeg";
 const FFMPEG_SOURCE_REF: &str = "release/8.1";
 
@@ -205,9 +205,9 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
 
 fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     let name = match target {
-        "x86_64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linux64-gpl.tar.xz",
-        "aarch64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linuxarm64-gpl.tar.xz",
-        "x86_64-pc-windows-msvc" => "ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+        "x86_64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linux64.zip",
+        "aarch64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linuxarm64.zip",
+        "x86_64-pc-windows-msvc" => "ffmpeg-n8.1-latest-win64.zip",
         _ => return Err(format!("不支持的目标架构：{target}").into()),
     };
     Ok(name)
