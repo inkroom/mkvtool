@@ -1,7 +1,6 @@
-FROM debian:bookworm-slim AS build
-
-ARG FFMPEG_REF=n7.1.1
-ARG TARGETARCH
+FROM debian:bookworm AS build
+ARG FFMPEG_REF=n8.1.2
+ARG TARGETARCH=amd64
 
 RUN sed -i \
         -e 's|http://deb.debian.org/debian-security|http://repo.huaweicloud.com/debian-security|g' \
@@ -57,5 +56,6 @@ RUN case "${TARGETARCH}" in \
 
 FROM scratch AS export
 
-COPY --from=build /opt/ffmpeg/bin/ffmpeg /ffmpeg
-COPY --from=build /opt/ffmpeg/bin/ffprobe /ffprobe
+# COPY --from=build /opt/ffmpeg/bin/ffmpeg /ffmpeg
+# COPY --from=build /opt/ffmpeg/bin/ffprobe /ffprobe
+COPY --from=build /opt/ffmpeg/ /

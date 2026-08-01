@@ -28,7 +28,7 @@ struct MediaFile {
 #[serde(rename_all = "camelCase")]
 struct MediaStream {
     index: u32,
-    stream_type: String,
+    stream_type: MediaStreamType,
     codec_name: Option<String>,
     codec_description: Option<String>,
     title: Option<String>,
@@ -36,6 +36,17 @@ struct MediaStream {
     default_stream: bool,
     forced: bool,
     editable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MediaStreamType {
+    Video,
+    Audio,
+    Subtitle,
+    Attachment,
+    Data,
+    Unknown,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,15 +77,15 @@ impl SubtitleServer {
             .map(|edit| (format!("/{}", edit.stream_index), edit.content.clone()))
             .collect::<HashMap<_, _>>();
         let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|error| format!("无法创建内存字幕输入：{error}"))?;
+            .map_err(|error| format!("无法创建字幕输入：{error}"))?;
         listener
             .set_nonblocking(true)
-            .map_err(|error| format!("无法配置内存字幕输入：{error}"))?;
+            .map_err(|error| format!("无法配置字幕输入：{error}"))?;
         let base_url = format!(
             "http://{}",
             listener
                 .local_addr()
-                .map_err(|error| format!("无法读取内存字幕输入地址：{error}"))?
+                .map_err(|error| format!("无法读取字幕输入地址：{error}"))?
         );
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = Arc::clone(&running);
@@ -109,7 +120,7 @@ impl SubtitleServer {
                     }
                 }
             })
-            .map_err(|error| format!("无法启动内存字幕输入：{error}"))?;
+            .map_err(|error| format!("无法启动字幕输入：{error}"))?;
 
         Ok(Self {
             base_url,
@@ -146,7 +157,7 @@ struct ProbeFormat {
 #[derive(Debug, serde::Deserialize)]
 struct ProbeStream {
     index: u32,
-    codec_type: String,
+    codec_type: MediaStreamType,
     codec_name: Option<String>,
     codec_long_name: Option<String>,
     tags: Option<StreamTags>,
@@ -177,10 +188,20 @@ trait FfmpegService: Send + Sync {
 }
 
 #[derive(Clone)]
-struct SystemFfmpegService;
+struct CliFfmpegService;
 
-impl SystemFfmpegService {
-    fn new(_app: tauri::AppHandle) -> Self {
+#[cfg(feature = "embe")]
+#[derive(Clone)]
+struct FFIFfmpegService;
+
+#[cfg(feature = "embe")]
+type ActiveFfmpegService = FFIFfmpegService;
+
+#[cfg(not(feature = "embe"))]
+type ActiveFfmpegService = CliFfmpegService;
+#[cfg(any(not(feature = "embe"), test))]
+impl CliFfmpegService {
+    fn new() -> Self {
         Self
     }
 
@@ -249,15 +270,6 @@ impl SystemFfmpegService {
         Err(command_error("ffmpeg", &output.stderr))
     }
 
-    fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static str)> {
-        match codec_name {
-            "subrip" | "srt" => Some(("srt", "srt")),
-            "ass" | "ssa" => Some(("ass", "ass")),
-            "webvtt" => Some(("webvtt", "webvtt")),
-            _ => None,
-        }
-    }
-
     fn editable_stream<'a>(
         &self,
         probe: &'a ProbeResult,
@@ -273,10 +285,21 @@ impl SystemFfmpegService {
             .as_deref()
             .ok_or_else(|| "所选字幕流没有可识别的编码。".to_string())?;
 
-        if stream.codec_type != "subtitle" || Self::subtitle_specification(codec_name).is_none() {
+        if stream.codec_type != MediaStreamType::Subtitle
+            || subtitle_specification(codec_name).is_none()
+        {
             return Err("目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流；图形字幕会保留但不可编辑。".to_string());
         }
         Ok(stream)
+    }
+}
+
+fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static str)> {
+    match codec_name {
+        "subrip" | "srt" => Some(("srt", "srt")),
+        "ass" | "ssa" => Some(("ass", "ass")),
+        "webvtt" => Some(("webvtt", "webvtt")),
+        _ => None,
     }
 }
 
@@ -348,7 +371,7 @@ fn parse_ffmpeg_stream_line(line: &str) -> Option<ProbeStream> {
 
     Some(ProbeStream {
         index,
-        codec_type: ffmpeg_stream_type(codec_type.trim())?.to_string(),
+        codec_type: ffmpeg_stream_type(codec_type.trim())?,
         codec_name,
         codec_long_name: Some(codec_description.to_string()),
         tags: language.map(|language| StreamTags {
@@ -362,13 +385,13 @@ fn parse_ffmpeg_stream_line(line: &str) -> Option<ProbeStream> {
     })
 }
 
-fn ffmpeg_stream_type(value: &str) -> Option<&'static str> {
+fn ffmpeg_stream_type(value: &str) -> Option<MediaStreamType> {
     match value {
-        "Video" => Some("video"),
-        "Audio" => Some("audio"),
-        "Subtitle" => Some("subtitle"),
-        "Attachment" => Some("attachment"),
-        "Data" => Some("data"),
+        "Video" => Some(MediaStreamType::Video),
+        "Audio" => Some(MediaStreamType::Audio),
+        "Subtitle" => Some(MediaStreamType::Subtitle),
+        "Attachment" => Some(MediaStreamType::Attachment),
+        "Data" => Some(MediaStreamType::Data),
         _ => None,
     }
 }
@@ -387,6 +410,152 @@ fn ffmpeg_duration_seconds(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        error::Error,
+        fs::File,
+        sync::{Mutex, MutexGuard, OnceLock},
+    };
+
+    const TEST_MKV_URL: &str = "https://github.com/inkroom/mkvtool/releases/download/resource/test.mkv";
+    static FFMPEG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn ffmpeg_test_lock() -> MutexGuard<'static, ()> {
+        FFMPEG_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn test_target_dir() -> Result<PathBuf, Box<dyn Error>> {
+        std::env::current_exe()?
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法定位 Cargo target 目录".into())
+    }
+
+    fn download_test_mkv() -> Result<PathBuf, Box<dyn Error>> {
+        let fixture_dir = test_target_dir()?.join("ffmpeg-test-fixtures");
+        let fixture = fixture_dir.join("test.mkv");
+        if fixture.is_file() && fixture.metadata()?.len() > 0 {
+            return Ok(fixture);
+        }
+
+        fs::create_dir_all(&fixture_dir)?;
+        let temporary = fixture.with_extension(format!("mkv-{}", std::process::id()));
+        let response = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .get(TEST_MKV_URL)
+            .call()?;
+        let mut reader = response.into_reader();
+        let mut output = File::create(&temporary)?;
+        std::io::copy(&mut reader, &mut output)?;
+        if output.metadata()?.len() == 0 {
+            return Err("下载的 FFmpeg 测试文件为空".into());
+        }
+        fs::rename(&temporary, &fixture)?;
+        Ok(fixture)
+    }
+
+    fn first_editable_subtitle(
+        service: &ActiveFfmpegService,
+        input: &Path,
+    ) -> Result<u32, String> {
+        service
+            .inspect(input)?
+            .streams
+            .iter()
+            .find(|stream| stream.editable)
+            .map(|stream| stream.index)
+            .ok_or_else(|| "测试文件中没有可编辑字幕流。".to_string())
+    }
+
+    #[test]
+    fn assert_inspects_downloaded_test_file() {
+        let _lock = ffmpeg_test_lock();
+        let input = download_test_mkv().expect("测试文件应下载到 target 目录");
+        let service = ActiveFfmpegService::new();
+        let media = service.inspect(&input).expect("FFmpeg 应能探测测试文件");
+
+        assert!(!media.streams.is_empty());
+        assert!(media
+            .streams
+            .iter()
+            .any(|stream| stream.stream_type == MediaStreamType::Video));
+        assert!(media
+            .streams
+            .iter()
+            .any(|stream| stream.stream_type == MediaStreamType::Audio));
+        assert!(media
+            .streams
+            .iter()
+            .any(|stream| stream.stream_type == MediaStreamType::Subtitle));
+        let subtitle = media
+            .streams
+            .iter()
+            .find(|stream| stream.editable)
+            .expect("测试文件应包含可编辑字幕流");
+        assert_eq!(subtitle.codec_name.as_deref(), Some("ass"));
+    }
+
+    #[test]
+    fn assert_reads_subtitle_from_downloaded_test_file() {
+        let _lock = ffmpeg_test_lock();
+        let input = download_test_mkv().expect("测试文件应下载到 target 目录");
+        let service = ActiveFfmpegService::new();
+        let ffmpeg = CliFfmpegService::new();
+        let streams = service
+            .inspect(&input)
+            .expect("FFmpeg 应能探测测试文件")
+            .streams;
+        let editable_streams = streams.iter().filter(|stream| stream.editable);
+
+        assert!(editable_streams.clone().next().is_some(), "测试文件应包含可编辑字幕流");
+        for stream in editable_streams {
+            let subtitle = service
+                .read_subtitle(&input, stream.index)
+                .expect("FFI FFmpeg 应能读取测试字幕");
+            let ffmpeg_subtitle = ffmpeg
+                .read_subtitle(&input, stream.index)
+                .expect("FFmpeg CLI 应能读取测试字幕");
+
+            assert_eq!(subtitle.format, ffmpeg_subtitle.format, "字幕流 #{} 格式不一致", stream.index);
+            assert_eq!(subtitle.codec_name, ffmpeg_subtitle.codec_name, "字幕流 #{} 编码不一致", stream.index);
+            assert_eq!(subtitle.content, ffmpeg_subtitle.content, "字幕流 #{} 文本不一致", stream.index);
+        }
+    }
+
+    #[test]
+    fn assert_remuxes_subtitle_from_downloaded_test_file() {
+        let _lock = ffmpeg_test_lock();
+        let input = download_test_mkv().expect("测试文件应下载到 target 目录");
+        let service = ActiveFfmpegService::new();
+        let stream_index = first_editable_subtitle(&service, &input)
+            .expect("测试文件应包含可编辑字幕流");
+        let subtitle = service
+            .read_subtitle(&input, stream_index)
+            .expect("FFmpeg 应能读取测试字幕");
+        let output = test_target_dir()
+            .expect("应能定位 Cargo target 目录")
+            .join("ffmpeg-test-fixtures")
+            .join("remuxed-test.mkv");
+
+        service
+            .remux_subtitles(
+                &input,
+                &output,
+                &[SubtitleEdit {
+                    stream_index,
+                    content: subtitle.content,
+                }],
+            )
+            .expect("FFmpeg 应能重新混流测试字幕");
+
+        let remuxed = service.inspect(&output).expect("FFmpeg 应能探测重混流结果");
+        assert_eq!(remuxed.streams.len(), service.inspect(&input).unwrap().streams.len());
+    }
 
     #[test]
     fn parses_ffmpeg_input_description() {
@@ -405,16 +574,17 @@ Input #0, matroska,webm, from 'sample.mkv':
 
         let subtitle = &probe.streams[1];
         assert_eq!(subtitle.index, 1);
-        assert_eq!(subtitle.codec_type, "subtitle");
+        assert_eq!(subtitle.codec_type, MediaStreamType::Subtitle);
         assert_eq!(subtitle.codec_name.as_deref(), Some("ass"));
         assert_eq!(subtitle.tags.as_ref().and_then(|tags| tags.language.as_deref()), Some("eng"));
         assert_eq!(subtitle.tags.as_ref().and_then(|tags| tags.title.as_deref()), Some("English subtitles"));
         assert_eq!(subtitle.disposition.as_ref().and_then(|value| value.default), Some(1));
         assert_eq!(subtitle.disposition.as_ref().and_then(|value| value.forced), Some(1));
     }
-}
 
-impl FfmpegService for SystemFfmpegService {
+}
+#[cfg(any(not(feature = "embe"), test))]
+impl FfmpegService for CliFfmpegService {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
         let probe = self.probe(path)?;
         let streams = probe
@@ -422,10 +592,10 @@ impl FfmpegService for SystemFfmpegService {
             .into_iter()
             .map(|stream| {
                 let codec_name = stream.codec_name;
-                let editable = stream.codec_type == "subtitle"
+                let editable = stream.codec_type == MediaStreamType::Subtitle
                     && codec_name
                         .as_deref()
-                        .and_then(Self::subtitle_specification)
+                        .and_then(subtitle_specification)
                         .is_some();
                 let tags = stream.tags;
                 let disposition = stream.disposition.unwrap_or_default();
@@ -459,7 +629,7 @@ impl FfmpegService for SystemFfmpegService {
         let probe = self.probe(path)?;
         let stream = self.editable_stream(&probe, stream_index)?;
         let codec_name = stream.codec_name.as_deref().unwrap_or_default();
-        let (format, _) = Self::subtitle_specification(codec_name).unwrap();
+        let (format, _) = subtitle_specification(codec_name).unwrap();
         let output = self
             .sidecar_command("ffm")?
             .args(["-v", "error", "-i"])
@@ -500,7 +670,7 @@ impl FfmpegService for SystemFfmpegService {
             }
             let stream = self.editable_stream(&probe, edit.stream_index)?;
             let codec_name = stream.codec_name.as_deref().unwrap_or_default();
-            let (format, _) = Self::subtitle_specification(codec_name).unwrap();
+            let (format, _) = subtitle_specification(codec_name).unwrap();
             formats.push(format);
         }
 
@@ -555,6 +725,318 @@ impl FfmpegService for SystemFfmpegService {
     }
 }
 
+#[cfg(feature = "embe")]
+impl FFIFfmpegService {
+    fn new() -> Self {
+        Self
+    }
+
+    fn initialize() -> Result<(), String> {
+        static INITIALIZATION: std::sync::OnceLock<Result<(), String>> =
+            std::sync::OnceLock::new();
+
+        INITIALIZATION
+            .get_or_init(|| {
+                ffmpeg_next::init().map_err(|error| format!("无法初始化 FFmpeg 库：{error}"))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+            .copied()
+    }
+
+    fn stream_type(medium: ffmpeg_next::media::Type) -> MediaStreamType {
+        match medium {
+            ffmpeg_next::media::Type::Video => MediaStreamType::Video,
+            ffmpeg_next::media::Type::Audio => MediaStreamType::Audio,
+            ffmpeg_next::media::Type::Subtitle => MediaStreamType::Subtitle,
+            ffmpeg_next::media::Type::Attachment => MediaStreamType::Attachment,
+            ffmpeg_next::media::Type::Data => MediaStreamType::Data,
+            ffmpeg_next::media::Type::Unknown => MediaStreamType::Unknown,
+        }
+    }
+
+    fn subtitle_document(
+        path: &Path,
+        stream_index: u32,
+    ) -> Result<SubtitleDocument, String> {
+        let mut input = ffmpeg_next::format::input(path)
+            .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+        let stream = input
+            .streams()
+            .find(|stream| stream.index() == stream_index as usize)
+            .ok_or_else(|| "未找到所选字幕流。".to_string())?;
+        let time_base = stream.time_base();
+        let parameters = stream.parameters();
+        let codec_name = subtitle_specification(parameters.id().name())
+            .map(|(_, canonical_name)| canonical_name)
+            .unwrap_or_else(|| parameters.id().name())
+            .to_string();
+        let mut content = if codec_name == "ass" {
+            Self::ass_header(&parameters)?
+        } else {
+            String::new()
+        };
+        let (format, _) = subtitle_specification(&codec_name).ok_or_else(|| {
+            "目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流；图形字幕会保留但不可编辑。"
+                .to_string()
+        })?;
+        let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(parameters)
+            .map_err(|error| format!("无法创建字幕解码器：{error}"))?
+            .decoder()
+            .subtitle()
+            .map_err(|error| format!("无法打开字幕解码器：{error}"))?;
+
+        for (packet_stream, packet) in input.packets() {
+            if packet_stream.index() != stream_index as usize {
+                continue;
+            }
+            let mut subtitle = ffmpeg_next::Subtitle::new();
+            if decoder
+                .decode(&packet, &mut subtitle)
+                .map_err(|error| format!("无法解码字幕：{error}"))?
+            {
+                for rect in subtitle.rects() {
+                    match rect {
+                        ffmpeg_next::subtitle::Rect::Ass(rect) => {
+                            if codec_name == "ass" {
+                                content.push_str(&Self::ass_dialogue(
+                                    rect.get(),
+                                    packet.pts().unwrap_or_default(),
+                                    packet.duration(),
+                                    time_base,
+                                ));
+                            } else {
+                                content.push_str(rect.get());
+                            }
+                            content.push('\n');
+                        }
+                        ffmpeg_next::subtitle::Rect::Text(rect) => {
+                            content.push_str(rect.get());
+                            content.push('\n');
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if codec_name == "ass" && !content.is_empty() {
+            content.push('\n');
+        }
+
+        if content.is_empty() {
+            return Err("字幕流不包含可编辑的文本事件。".to_string());
+        }
+        Ok(SubtitleDocument {
+            content,
+            format: format.to_string(),
+            codec_name,
+        })
+    }
+
+    fn ass_header(parameters: &ffmpeg_next::codec::Parameters) -> Result<String, String> {
+        let parameters = unsafe { &*parameters.as_ptr() };
+        if parameters.extradata.is_null() || parameters.extradata_size <= 0 {
+            return Err("ASS 字幕流缺少 Script Info 头信息。".to_string());
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                parameters.extradata,
+                parameters.extradata_size as usize,
+            )
+        };
+        let mut header = String::from_utf8(bytes.to_vec())
+            .map_err(|_| "ASS 字幕头不是 UTF-8 文本，暂时无法在编辑器中打开。".to_string())?;
+        header = header.replace("\r\n", "\n");
+        header = header.trim_end_matches(['\0', '\r', '\n']).to_string();
+        header.push('\n');
+        Ok(header)
+    }
+
+    fn ass_dialogue(
+        dialogue: &str,
+        pts: i64,
+        duration: i64,
+        time_base: ffmpeg_next::Rational,
+    ) -> String {
+        let dialogue = dialogue
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("Dialogue: ")
+            .unwrap_or(dialogue.trim_end_matches(['\r', '\n']));
+        let mut fields = dialogue
+            .splitn(10, ',')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if fields.len() >= 3 {
+            fields[1] = Self::ass_timestamp(pts, time_base);
+            fields[2] = Self::ass_timestamp(pts.saturating_add(duration), time_base);
+        }
+        format!("Dialogue: {}", fields.join(","))
+    }
+
+    fn ass_timestamp(timestamp: i64, time_base: ffmpeg_next::Rational) -> String {
+        let centiseconds = timestamp
+            .saturating_mul(time_base.numerator() as i64)
+            .saturating_mul(100)
+            / time_base.denominator() as i64;
+        let hours = centiseconds / 360_000;
+        let minutes = (centiseconds / 6_000) % 60;
+        let seconds = (centiseconds / 100) % 60;
+        format!("{hours}:{minutes:02}:{seconds:02}.{:02}", centiseconds % 100)
+    }
+
+    fn remux_document(
+        input_path: &Path,
+        output_path: &Path,
+        edits: &[SubtitleEdit],
+    ) -> Result<(), String> {
+        if edits.is_empty() {
+            return Err("没有需要导出的字幕修改。".to_string());
+        }
+        let mut input = ffmpeg_next::format::input(input_path)
+            .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+        let mut replacements = HashMap::new();
+        for edit in edits {
+            if replacements.insert(edit.stream_index as usize, edit).is_some() {
+                return Err(format!("字幕流 #{} 被重复提交。", edit.stream_index));
+            }
+            let stream = input
+                .streams()
+                .find(|stream| stream.index() == edit.stream_index as usize)
+                .ok_or_else(|| "未找到所选字幕流。".to_string())?;
+            if Self::stream_type(stream.parameters().medium()) != MediaStreamType::Subtitle
+                || subtitle_specification(stream.parameters().id().name()).is_none()
+            {
+                return Err("目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流；图形字幕会保留但不可编辑。".to_string());
+            }
+        }
+
+        let mut output = ffmpeg_next::format::output(output_path)
+            .map_err(|error| format!("无法创建输出文件：{error}"))?;
+        output.set_metadata(input.metadata().to_owned());
+        for stream in input.streams() {
+            let parameters = stream.parameters();
+            let context = ffmpeg_next::codec::context::Context::from_parameters(parameters)
+                .map_err(|error| format!("无法复制流参数：{error}"))?;
+            let mut output_stream = output
+                .add_stream_with(&context)
+                .map_err(|error| format!("无法创建输出流：{error}"))?;
+            output_stream.set_time_base(stream.time_base());
+            output_stream.set_metadata(stream.metadata().to_owned());
+        }
+        output
+            .write_header()
+            .map_err(|error| format!("无法写入 MKV 头：{error}"))?;
+
+        let mut emitted_replacements = HashSet::new();
+        for (stream, packet) in input.packets() {
+            let index = stream.index();
+            if let Some(edit) = replacements.get(&index) {
+                if emitted_replacements.insert(index) {
+                    let mut replacement = ffmpeg_next::Packet::copy(edit.content.as_bytes());
+                    replacement.set_stream(index);
+                    replacement.set_pts(Some(0));
+                    replacement.set_dts(Some(0));
+                    replacement.set_duration(1);
+                    replacement
+                        .write_interleaved(&mut output)
+                        .map_err(|error| format!("无法写入编辑后的字幕：{error}"))?;
+                }
+                continue;
+            }
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|error| format!("无法写入媒体数据：{error}"))?;
+        }
+        output
+            .write_trailer()
+            .map_err(|error| format!("无法完成 MKV 写入：{error}"))
+    }
+}
+
+#[cfg(feature = "embe")]
+impl FfmpegService for FFIFfmpegService {
+    fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
+        use ffmpeg_next::format::stream::Disposition;
+
+        Self::initialize()?;
+        let context = ffmpeg_next::format::input(path)
+            .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+        let streams = context
+            .streams()
+            .map(|stream| {
+                let parameters = stream.parameters();
+                let codec_id = parameters.id();
+                let codec = ffmpeg_next::decoder::find(codec_id);
+                let codec_name = codec
+                    .as_ref()
+                    .map(|codec| codec.name().to_string())
+                    .or_else(|| {
+                        let name = codec_id.name();
+                        (name != "none").then(|| name.to_string())
+                    })
+                    .map(|name| {
+                        subtitle_specification(&name)
+                            .map(|(_, canonical_name)| canonical_name.to_string())
+                            .unwrap_or(name)
+                    });
+                let codec_description = codec
+                    .as_ref()
+                    .map(|codec| codec.description().to_string())
+                    .filter(|description| !description.is_empty());
+                let metadata = stream.metadata();
+                let disposition = stream.disposition();
+                let stream_type = Self::stream_type(parameters.medium());
+                let editable = stream_type == MediaStreamType::Subtitle
+                    && codec_name
+                        .as_deref()
+                        .and_then(subtitle_specification)
+                        .is_some();
+
+                MediaStream {
+                    index: stream.index() as u32,
+                    stream_type,
+                    codec_name,
+                    codec_description,
+                    title: metadata.get("title").map(str::to_string),
+                    language: metadata.get("language").map(str::to_string),
+                    default_stream: disposition.contains(Disposition::DEFAULT),
+                    forced: disposition.contains(Disposition::FORCED),
+                    editable,
+                }
+            })
+            .collect();
+        let duration = (context.duration() >= 0)
+            .then(|| (context.duration() as f64 / 1_000_000.0).to_string());
+
+        Ok(MediaFile {
+            path: path.display().to_string(),
+            name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("未知文件")
+                .to_string(),
+            duration,
+            streams,
+        })
+    }
+
+    fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String> {
+        Self::initialize()?;
+        Self::subtitle_document(path, stream_index)
+    }
+
+    fn remux_subtitles(
+        &self,
+        input: &Path,
+        output: &Path,
+        edits: &[SubtitleEdit],
+    ) -> Result<(), String> {
+        Self::initialize()?;
+        Self::remux_document(input, output, edits)
+    }
+}
+
 fn command_error(command: &str, stderr: &[u8]) -> String {
     let detail = String::from_utf8_lossy(stderr).trim().to_string();
     if detail.is_empty() {
@@ -580,9 +1062,9 @@ fn mkv_path(path: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn inspect_mkv(app: tauri::AppHandle, path: String) -> Result<MediaFile, String> {
+async fn inspect_mkv(_app: tauri::AppHandle, path: String) -> Result<MediaFile, String> {
     let path = mkv_path(&path)?;
-    let service = SystemFfmpegService::new(app);
+    let service = ActiveFfmpegService::new();
     tauri::async_runtime::spawn_blocking(move || service.inspect(&path))
         .await
         .map_err(|error| format!("处理媒体文件时出错：{error}"))?
@@ -590,12 +1072,12 @@ async fn inspect_mkv(app: tauri::AppHandle, path: String) -> Result<MediaFile, S
 
 #[tauri::command]
 async fn read_subtitle(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     path: String,
     stream_index: u32,
 ) -> Result<SubtitleDocument, String> {
     let path = mkv_path(&path)?;
-    let service = SystemFfmpegService::new(app);
+    let service = ActiveFfmpegService::new();
     tauri::async_runtime::spawn_blocking(move || service.read_subtitle(&path, stream_index))
     .await
     .map_err(|error| format!("读取字幕时出错：{error}"))?
@@ -603,7 +1085,7 @@ async fn read_subtitle(
 
 #[tauri::command]
 async fn save_subtitles(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     input_path: String,
     output_path: String,
     edits: Vec<SubtitleEdit>,
@@ -613,7 +1095,7 @@ async fn save_subtitles(
     if output.as_os_str().is_empty() || output.extension().and_then(|extension| extension.to_str()) != Some("mkv") {
         return Err("输出文件必须使用 .mkv 扩展名。".to_string());
     }
-    let service = SystemFfmpegService::new(app);
+    let service = ActiveFfmpegService::new();
     tauri::async_runtime::spawn_blocking(move || service.remux_subtitles(&input, &output, &edits))
     .await
     .map_err(|error| format!("重新混流时出错：{error}"))?

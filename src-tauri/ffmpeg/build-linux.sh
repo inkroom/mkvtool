@@ -1,5 +1,5 @@
 #!/bin/sh
-set -eu
+set -ex
 
 target=${1:-x86_64-unknown-linux-gnu}
 
@@ -14,19 +14,13 @@ esac
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 src_tauri_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-output_dir=$(mktemp -d)
+output_dir=$(CDPATH= cd -- "$src_tauri_dir/.." && (mkdir ffmpeg-Linux || true )&& cd ffmpeg-Linux && pwd)
 
-cleanup() {
-  rm -rf "$output_dir"
-}
-
-trap cleanup EXIT
-
-docker buildx build \
-  --platform "$platform" \
-  --output "type=local,dest=$output_dir" \
-  --file "$script_dir/Dockerfile.linux" \
+docker buildx build --progress=plain\
+  --output="type=local,dest=$output_dir" \
+  --file="$script_dir/Dockerfile.linux" \
   "$script_dir"
+
 mkdir -p "$src_tauri_dir/binaries"
-install -m 755 "$output_dir/ffmpeg" "$src_tauri_dir/binaries/ffm-$target"
-install -m 755 "$output_dir/ffprobe" "$src_tauri_dir/binaries/ffp-$target"
+install -m 755 "$output_dir/bin/ffmpeg" "$src_tauri_dir/binaries/ffm-$target"
+install -m 755 "$output_dir/bin/ffprobe" "$src_tauri_dir/binaries/ffp-$target"

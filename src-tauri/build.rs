@@ -188,7 +188,7 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&binaries_dir)?;
     let archive_name = archive_name(&target)?;
     let url = format!("{RELEASE_URL}/{archive_name}");
-    println!("cargo:warning=Downloading FFmpeg sidecars for {target} from BtbN/FFmpeg-Builds");
+    println!("cargo:warning=Downloading FFmpeg sidecars for {target} from Github, url = {}",url);
     let response = ureq::get(&url).call()?;
     let mut archive = Vec::new();
     response.into_reader().read_to_end(&mut archive)?;
@@ -208,6 +208,7 @@ fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>
         "x86_64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linux64.zip",
         "aarch64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linuxarm64.zip",
         "x86_64-pc-windows-msvc" => "ffmpeg-n8.1-latest-win64.zip",
+        "x86_64-pc-windows-gnu" => "ffmpeg-n8.1-latest-win64.zip",
         _ => return Err(format!("不支持的目标架构：{target}").into()),
     };
     Ok(name)

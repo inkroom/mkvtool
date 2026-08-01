@@ -18,28 +18,54 @@ jobs:
         id: cache
         uses: actions/cache@v5
         with:
-          path: src-tauri/binaries
+          path: | 
+            src-tauri/binaries
           key: ffmpeg
-      - name: Build FFmpeg sidecars
-        if: steps.cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          mkdir src-tauri/binaries
-          sh src-tauri/ffmpeg/build-windows.sh
-          ls -all -h src-tauri/binaries
-      - name: Build FFmpeg sidecars
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Cache FFmpeg Windows Lib
+        uses: actions/cache@v5
+        id: wc
+        with:
+          path: ffmpeg-Windows
+          key: ffmpeg-lib-Windows
+      - name: Cache FFmpeg Linux Lib
+        uses: actions/cache@v5
+        id: lc
+        with:
+          path: ffmpeg-Linux
+          key: ffmpeg-lib-Linux
+      - name: Build FFmpeg Linux
+        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
         shell: bash
         run: |
           sh src-tauri/ffmpeg/build-linux.sh
           ls -all -h src-tauri/binaries
-      - name: Upload platform bundles
+          ls -all -h ffmpeg-Linux/lib
+      - name: Build FFmpeg Windows
+        if: steps.cache.outputs.cache-hit != 'true' || steps.wc.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sh src-tauri/ffmpeg/build-windows.sh
+          ls -all -h src-tauri/binaries
+          ls -all -h ffmpeg-Windows/lib
+ 
+      - name: Upload FFmpeg binaries
         uses: actions/upload-artifact@v7
         with:
           name: ffmpeg
           if-no-files-found: error
           path: src-tauri/binaries/*
-      
+      - name: Upload FFmpeg lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-lib-Linux
+          if-no-files-found: error
+          path: ffmpeg-Linux
+      - name: Upload FFmpeg lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-lib-Windows
+          if-no-files-found: error
+          path: ffmpeg-Windows
   build:
     needs: ["prepare"]
     permissions:
@@ -51,11 +77,11 @@ jobs:
       matrix:
         include:
           - platform: 'macos-latest' # for Arm based macs (M1 and above).
-            rust_target: aarch64-apple-darwin
+            rust_target: ''
           - platform: 'ubuntu-24.04'
-            rust_target: x86_64-unknown-linux-gnu
+            rust_target: ''
           - platform: 'windows-latest'
-            rust_target: x86_64-pc-windows-msvc
+            rust_target: ''
 
 
     runs-on: ${{ matrix.platform }}
@@ -78,31 +104,86 @@ jobs:
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,aarch64-apple-darwin,x86_64-unknown-linux-gnu
       - name: Download FFmpeg
         uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-          pattern: ffmpeg*
+          pattern: ffmpeg
           path: src-tauri/binaries/
+      - name: Download FFmpeg Lib
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: ffmpeg-lib-${{ runner.os }}
+          path: ffmpeg-${{ runner.os }}
       - name: install dependencies (ubuntu only)
         if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
         run: |
+            tree ffmpeg-${{ runner.os }}
             sudo apt update
             sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils zip
       - name: install frontend dependencies
+        id: home
         run: |
+          ls ffmpeg-${{ runner.os }} || true
+          ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
           npm install
+      - name: Build FFmpeg
+        if: ${{ runner.os  == 'Macos' }} 
+        run: |
+          brew install ffmpeg pkg-config
+          prefix="$(pwd)/ffmpeg-${{ runner.os }}"
+
+          git clone -b release/8.1 https://github.com/ffmpeg/ffmpeg ff-src
+          (
+           cd ff-src
+           ./configure --disable-everything \
+                --prefix="$prefix" \
+                --extra-cflags='-march=native -mtune=native' \
+                --extra-cflags=-w \
+                --disable-debug \
+                --disable-stripping \
+                --enable-static \
+                --disable-shared \
+                --enable-pthreads \
+                --disable-pic \
+                --disable-autodetect \
+                --disable-programs \
+                --disable-doc \
+                --disable-gpl \
+                --disable-version3 \
+                --disable-nonfree \
+                --enable-avcodec \
+                --disable-avdevice \
+                --enable-avformat \
+                --disable-swresample \
+                --disable-swscale \
+                --extra-cflags=-w \
+                --enable-ffmpeg \
+                --enable-ffprobe \
+                --enable-avfilter \
+                --enable-protocol=file,pipe \
+                --enable-demuxer=matroska,ass,srt \
+                --enable-muxer=matroska,ass,srt \
+                --enable-decoder=ass,ssa,subrip \
+                --enable-encoder=ass,ssa,subrip 
+                make && make install
+          )
       - name: Build
         uses: tauri-apps/tauri-action@v1
         id: build
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
           tagName: "temp" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "temp"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.rust_target }} 
       - name: Test Version (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -204,12 +285,12 @@ jobs:
             echo "tag=$new_tag" >> $GITHUB_OUTPUT
             # 如果直接指向master，release会落后一个commit
             # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
-      - name: Download Artifacts
-        uses: actions/download-artifact@v8
-        with:
-          merge-multiple: true
-          pattern: artifacts-*
-          path: artifacts
+      # - name: Download Artifacts
+      #   uses: actions/download-artifact@v8
+      #   with:
+      #     merge-multiple: true
+      #     pattern: artifacts-*
+      #     path: artifacts
       - name: Download FFmpeg
         uses: actions/download-artifact@v8
         with:
