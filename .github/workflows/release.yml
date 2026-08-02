@@ -4,87 +4,14 @@ on:
   push:
     branches:
       - master
-
+env:
+  temp_release: temp
 
 jobs:
-  prepare:
-    name: Build FFmpeg
-    runs-on: ubuntu-latest
+  linux:
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache FFmpeg
-        id: cache
-        uses: actions/cache@v5
-        with:
-          path: | 
-            src-tauri/binaries
-          key: ffmpeg
-      - name: Cache FFmpeg Windows Lib
-        uses: actions/cache@v5
-        id: wc
-        with:
-          path: ffmpeg-Windows
-          key: ffmpeg-lib-Windows
-      - name: Cache FFmpeg Linux Lib
-        uses: actions/cache@v5
-        id: lc
-        with:
-          path: ffmpeg-Linux
-          key: ffmpeg-lib-Linux
-      - name: Build FFmpeg Linux
-        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          sh src-tauri/ffmpeg/build-linux.sh
-          ls -all -h src-tauri/binaries
-          ls -all -h ffmpeg-Linux/lib
-      - name: Build FFmpeg Windows
-        if: steps.cache.outputs.cache-hit != 'true' || steps.wc.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          sh src-tauri/ffmpeg/build-windows.sh
-          ls -all -h src-tauri/binaries
-          ls -all -h ffmpeg-Windows/lib
- 
-      - name: Upload FFmpeg binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: ffmpeg
-          if-no-files-found: error
-          path: src-tauri/binaries/*
-      - name: Upload FFmpeg lib
-        uses: actions/upload-artifact@v7
-        with:
-          name: ffmpeg-lib-Linux
-          if-no-files-found: error
-          path: ffmpeg-Linux
-      - name: Upload FFmpeg lib
-        uses: actions/upload-artifact@v7
-        with:
-          name: ffmpeg-lib-Windows
-          if-no-files-found: error
-          path: ffmpeg-Windows
-  build:
-    needs: ["prepare"]
-    permissions:
-      contents: write
-    outputs: 
-       releaseId: ${{ steps.build.outputs.releaseId }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: 'macos-latest' # for Arm based macs (M1 and above).
-            rust_target: ''
-          - platform: 'ubuntu-24.04'
-            rust_target: ''
-          - platform: 'windows-latest'
-            rust_target: ''
-
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - name: Cache Target
@@ -92,7 +19,6 @@ jobs:
         with:
           workspaces: "src-tauri -> target"
       - name: Cache Bundle Resource # rust cache始终不缓存这个，只能单独缓存了
-        id: cache
         uses: actions/cache@v5
         with:
           path: src-tauri/target/.tauri
@@ -101,22 +27,42 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
-
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu,aarch64-apple-darwin,x86_64-unknown-linux-gnu
-      - name: Download FFmpeg
-        uses: actions/download-artifact@v8
+      - name: Cache FFmpeg binaries
+        id: cache
+        uses: actions/cache@v5
         with:
-          merge-multiple: true
-          pattern: ffmpeg
-          path: src-tauri/binaries/
-      - name: Download FFmpeg Lib
-        uses: actions/download-artifact@v8
+          path: | 
+            src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}
+      - name: Cache FFmpeg Linux Lib
+        uses: actions/cache@v5
+        id: lc
         with:
-          merge-multiple: true
-          pattern: ffmpeg-lib-${{ runner.os }}
+          path: ffmpeg-${{ runner.os }}
+          key: ffmpeg-lib-${{ runner.os }}
+      - name: Build FFmpeg Linux
+        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sh src-tauri/ffmpeg/build-linux.sh
+          ls -all -h src-tauri/binaries
+          ls -all -h ffmpeg-Linux/lib
+      
+      - name: Upload FFmpeg binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-${{ runner.os }}
+          if-no-files-found: error
+          path: src-tauri/binaries/*
+      - name: Upload FFmpeg lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-lib-${{ runner.os }}
+          if-no-files-found: error
           path: ffmpeg-${{ runner.os }}
       - name: install dependencies (ubuntu only)
         if: ${{ runner.os  == 'Linux' }} # This must match the platform value defined above.
@@ -130,8 +76,207 @@ jobs:
           ls ffmpeg-${{ runner.os }} || true
           ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
           npm install
+      - name: Build
+        uses: tauri-apps/tauri-action@v1
+        id: build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        with:
+          tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
+          releaseName: "${{ env.temp_release }}"
+          releaseBody: ''
+          releaseDraft: true
+          prerelease: false
+      - name: Test Version
+        shell: bash
+        run: |
+          ./src-tauri/target/release/mkv -v
+
+      - name: Create portable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir=src-tauri/target/release
+          portable_dir=protable/mkv-linux-x64
+          mkdir -p "$portable_dir"
+          find "$release_dir" -maxdepth 1 -type f -perm -111 ! -name '*.*' -exec cp -p {} "$portable_dir/" \;
+          (cd protable && zip -r mkv-linux-x64.zip mkv-linux-x64)
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: protable-${{ runner.os }}
+          if-no-files-found: error
+          path: protable/*.zip
+
+
+
+  windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+      - name: Cache Bundle Resource # rust cache始终不缓存这个，只能单独缓存了
+        uses: actions/cache@v5
+        with:
+          path: src-tauri/target/.tauri
+          key: bundle-${{runner.os}}
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,aarch64-apple-darwin,x86_64-unknown-linux-gnu
+      - name: Cache FFmpeg binaries
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: | 
+            src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}
+      - name: Cache FFmpeg Lib
+        uses: actions/cache@v5
+        id: lc
+        with:
+          path: ffmpeg-${{ runner.os }}
+          key: ffmpeg-lib-${{ runner.os }}
       - name: Build FFmpeg
-        if: ${{ runner.os  == 'Macos' }} 
+        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
+        env:
+          VCPKG_BUILD_TYPE: release
+        run: |
+          git clone https://github.com/microsoft/vcpkg/ --depth=1 -b 2026.06.01
+          New-Item -ItemType Directory -Force -Path "custom-ports/ffmpeg"
+          Copy-Item -Path "./vcpkg/ports/ffmpeg/*" -Destination "custom-ports/ffmpeg" -Recurse -Force
+          $portfile = "custom-ports/ffmpeg/portfile.cmake"
+          Get-Content $portfile
+          $content = Get-Content $portfile
+        
+          # 寻找 vcpkg_configure_make 内部的 OPTIONS 数组结束前的括号，注入参数
+          # 这里我们在 OPTIONS 的常见结构中寻找切入点，或者直接在追加到数组变量中
+          # 一种稳妥的做法是定位到 vcpkg_configure_make( 并在其 OPTIONS 后面插入
+          # 本处使用直接文本替换法，在 OPTIONS 关键字后插入自定义参数
+          $target = 'message(STATUS "Building Options: ${OPTIONS}")'
+          $custom_options = "set(OPTIONS `"--toolchain=msvc --enable-static --disable-shared  --disable-everything --disable-programs --enable-ffmpeg --enable-ffprobe --disable-avdevice --enable-avfilter --disable-swresample --disable-swscale  --disable-network --disable-doc --disable-debug --enable-protocol=file,pipe --enable-demuxer=matroska,ass,srt --enable-muxer=matroska,ass,srt --enable-decoder=ass,ssa,subrip --enable-encoder=ass,ssa,subrip --target-os=win32 --enable-w32threads --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --disable-bzlib --disable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --disable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-schannel --disable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --disable-libtheora --disable-libvorbis --disable-libvpx --disable-vulkan --disable-libwebp --disable-libx264 --disable-libx265 --disable-libxml2 --disable-zlib --disable-libsrt --disable-libvpl --disable-vaapi --disable-libzmq --disable-librubberband --cc=`${CC_filename} --cxx=`${CXX_filename} --windres=`${RC_filename} --ld=`${LD_filename} --ar='ar-lib `${AR_filename}' --ranlib=: --extra-cflags=-DHAVE_UNISTD_H=0 --pkg-config=\`"`${PKGCONFIG}\`" --pkg-config-flags=--static`")"
+          # 在目标字符串前面拼接自定义参数
+          $replacement = $custom_options + "`n    " + $target
+          
+          # 执行替换
+          $new_content = $content.Replace($target, $replacement)
+          
+          Set-Content -Path $portfile -Value $new_content
+          
+          # 打印修改后的文件片段用于验证 CI 日志
+          Write-Host "--- Modified portfile.cmake (Preview) ---"
+          Get-Content $portfile
+
+
+          vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static --overlay-ports=custom-ports --recurse
+          ls C:/vcpkg/packages/ffmpeg_x64-windows-static/
+          ls C:/vcpkg/packages/ffmpeg_x64-windows-static/lib
+          $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
+          $ffmpeg = $srcPath + "/bin/ffmpeg.exe"
+          $ffprobe = $srcPath + "/bin/ffprobe.exe"
+          $destPath = "${{ github.workspace }}/ffmpeg-${{ runner.os }}"
+          Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
+          ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+      - name: Upload FFmpeg binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-${{ runner.os }}
+          path: src-tauri/binaries/*
+      - name: Upload FFmpeg lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-lib-${{ runner.os }}
+          if-no-files-found: error
+          path: ffmpeg-${{ runner.os }}
+
+      - name: install frontend dependencies
+        id: home
+        run: |
+          ls ffmpeg-${{ runner.os }} || true
+          ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
+          npm install
+      - name: Build
+        uses: tauri-apps/tauri-action@v1
+        id: build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        with:
+          tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
+          releaseName: "${{ env.temp_release }}"
+          releaseBody: ''
+          releaseDraft: true
+          prerelease: false
+      - name: Test Version
+        shell: pwsh
+        run: |
+          & .\src-tauri\target\release\mkv.exe -v
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $releaseDir = "src-tauri/target/release"
+          $portableDir = "protable/mkv-windows-x64"
+          $zipPath = "protable/mkv-windows-x64.zip"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          $executables = Get-ChildItem $releaseDir -File -Filter "*.exe"
+          $executables | Copy-Item -Destination $portableDir
+          Compress-Archive -Path $portableDir -DestinationPath $zipPath -Force
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: protable-${{ runner.os }}
+          if-no-files-found: error
+          path: protable/*.zip
+
+
+  macos:
+    permissions:
+      contents: write
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+      - name: Cache Bundle Resource # rust cache始终不缓存这个，只能单独缓存了
+        uses: actions/cache@v5
+        with:
+          path: src-tauri/target/.tauri
+          key: bundle-${{runner.os}}
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,aarch64-apple-darwin,x86_64-unknown-linux-gnu
+      - name: Cache FFmpeg binaries
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: | 
+            src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}
+      - name: Cache FFmpeg Lib
+        uses: actions/cache@v5
+        id: lc
+        with:
+          path: ffmpeg-${{ runner.os }}
+          key: ffmpeg-lib-${{ runner.os }}
+      - name: Build FFmpeg
+        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
         run: |
           brew install ffmpeg pkg-config
           prefix="$(pwd)/ffmpeg-${{ runner.os }}"
@@ -171,6 +316,15 @@ jobs:
                 --enable-encoder=ass,ssa,subrip 
                 make && make install
           )
+          mkdir -p src-tauri/binaries
+          cp $prefix/bin/ffmpeg src-tauri/binaries/
+          cp $prefix/bin/ffprobe src-tauri/binaries/
+      - name: install frontend dependencies
+        id: home
+        run: |
+          ls ffmpeg-${{ runner.os }} || true
+          ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
+          npm install
       - name: Build
         uses: tauri-apps/tauri-action@v1
         id: build
@@ -178,66 +332,35 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
-          tagName: "temp" # the action automatically replaces \_\_VERSION\_\_ with the app version.
-          releaseName: "temp"
+          tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
+          releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.rust_target }} 
-      - name: Test Version (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+          args: ${{ matrix.rust_target }}
+      - name: Test Version
         run: |
           ./src-tauri/target/release/mkv -v
 
-      - name: Test Version (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          & .\src-tauri\target\release\mkv.exe -v
-
-      - name: Create portable Linux ZIP
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          release_dir=src-tauri/target/release
-          portable_dir=artifacts/mkv-linux-x64
-          mkdir -p "$portable_dir"
-          find "$release_dir" -maxdepth 1 -type f -perm -111 ! -name '*.*' -exec cp -p {} "$portable_dir/" \;
-          (cd artifacts && zip -r mkv-linux-x64.zip mkv-linux-x64)
-
       - name: Create portable macOS ZIP
-        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           release_dir=src-tauri/target/release
-          portable_dir=artifacts/mkv-macos-aarch64
+          portable_dir=protable/mkv-macos-aarch64
           mkdir -p "$portable_dir"
           find "$release_dir" -maxdepth 1 -type f -perm -111 ! -name '*.*' -exec cp -p {} "$portable_dir/" \;
-          (cd artifacts && zip -r mkv-macos-aarch64.zip mkv-macos-aarch64)
-
-      - name: Create portable Windows ZIP
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $releaseDir = "src-tauri/target/release"
-          $portableDir = "artifacts/mkv-windows-x64"
-          $zipPath = "artifacts/mkv-windows-x64.zip"
-          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
-          $executables = Get-ChildItem $releaseDir -File -Filter "*.exe"
-          $executables | Copy-Item -Destination $portableDir
-          Compress-Archive -Path $portableDir -DestinationPath $zipPath -Force
+          (cd protable && zip -r mkv-macos-aarch64.zip mkv-macos-aarch64)
 
       - name: Upload portable ZIP
         uses: actions/upload-artifact@v7
         with:
-          name: artifacts-${{ runner.os }}
+          name: protable-${{ runner.os }}
           if-no-files-found: error
-          path: artifacts/*.zip
+          path: protable/*.zip
+
   release:
-    needs: ["build"]
+    needs: ["windows","linux","macos"]
     permissions:
       contents: write
     
@@ -285,30 +408,25 @@ jobs:
             echo "tag=$new_tag" >> $GITHUB_OUTPUT
             # 如果直接指向master，release会落后一个commit
             # gh release create -n "$msg" --target $new_tag $(date +%Y%m%d) ./app/*
-      # - name: Download Artifacts
-      #   uses: actions/download-artifact@v8
-      #   with:
-      #     merge-multiple: true
-      #     pattern: artifacts-*
-      #     path: artifacts
-      - name: Download FFmpeg
+      - name: Download Artifacts
         uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-          pattern: ffmpeg*
-          path: artifacts
+          pattern: protable-*
+          path: protable
       - name: Delete Temp Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download temp -D app
-          ls -all app artifacts
-          gh release delete temp -y
+          ls -all protable/
+          gh release download ${{ env.temp_release }} -D app
+          ls -all app/
+          gh release delete ${{ env.temp_release }} -y
       - name: Create Release
         uses: ncipollo/release-action@v1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          artifacts: "app/*,artifacts/*"
+          artifacts: "app/*,protable/*"
           bodyFile: "body.md"
           tag: ${{ steps.ready.outputs.tag }}
