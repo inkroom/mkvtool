@@ -1,0 +1,83 @@
+FROM fullaxx/ubuntu-desktop
+ENV LANG C.UTF-8
+
+
+ENV CARGO_HOME=/usr/local/cargo
+
+
+ENV RUSTUP_HOME=/usr/local/rustup
+
+
+ENV PATH=${PATH}:${CARGO_HOME}/bin
+
+
+ENV TZ=Asia/Shanghai
+
+
+#ENV RUSTUP_DIST_SERVER=https://mirror.iscas.ac.cn/rustup
+#ENV RUSTUP_UPDATE_ROOT=https://mirror.iscas.ac.cn/rustup/rustup
+
+
+RUN dpkgArch="$(dpkg --print-architecture)"; \
+    case "${dpkgArch##*-}" in \
+        amd64) sed -i "s@http://.*archive.ubuntu.com@https://mirrors.tuna.tsinghua.edu.cn@g" /etc/apt/sources.list && sed -i "s@http://.*security.ubuntu.com@https://mirrors.tuna.tsinghua.edu.cn@g" /etc/apt/sources.list ;; \
+        arm64) sed -i "s@http://mirrors.huaweicloud.com@https://mirror.sjtu.edu.cn@g" /etc/apt/sources.list  ;; \
+        *) echo >&2 "unsupported architecture: ${dpkgArch}" ;; \
+    esac; apt update -y
+RUN apt install -y git zsh vim fonts-wqy-zenhei && git config --global core.editor vim
+RUN echo "LC_ALL=zh_CN.UTF-8" >> /etc/environment && \
+    echo "LANG=zh_CN.UTF-8" > /etc/locale.conf && \
+    echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen && \
+    locale-gen zh_CN.UTF-8 && \
+    update-locale LANG=zh_CN.UTF-8
+
+ARG NODE_VERSION=24.18.0
+ARG NODE_HOME=/usr/local/lib/nodejs
+ARG NODE_MIRROR=https://registry.npmmirror.com/
+ENV SASS_BINARY_SITE=https://registry.npmmirror.com/node-sass
+ENV PATH=${PATH}:${NODE_HOME}/bin
+
+RUN dpkgArch="$(dpkg --print-architecture)"; \
+    case "${dpkgArch##*-}" in \
+        amd64) NODE_DIST='linux-x64'; mkdir -p ${NODE_HOME} && wget -q https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && tar -zxf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz -C ${NODE_HOME} --strip-components 1 && rm -rf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && ${NODE_HOME}/bin/node -v && node -v && npm -v   && npm config set registry ${NODE_MIRROR}   && npm i -g nrm ;; \
+        armhf) NODE_DIST='linux-armv7l' ; mkdir -p ${NODE_HOME} && wget -q https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && tar -zxf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz -C ${NODE_HOME} --strip-components 1 && rm -rf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && ${NODE_HOME}/bin/node -v && node -v && npm -v   && npm config set registry ${NODE_MIRROR}   && npm i -g nrm  ;; \
+        arm64) NODE_DIST='linux-arm64' ; mkdir -p ${NODE_HOME} && wget https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && tar -zxf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz -C ${NODE_HOME} --strip-components 1 && rm -rf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && ${NODE_HOME}/bin/node -v && node -v && npm -v   && npm config set registry ${NODE_MIRROR}   && npm i -g nrm  ;; \
+        i386) echo "not install node" ;; \
+        s390x) NODE_DIST='linux-s390x' ; mkdir -p ${NODE_HOME} && wget -q https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && tar -zxf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz -C ${NODE_HOME} --strip-components 1 && rm -rf node-v${NODE_VERSION}-${NODE_DIST}.tar.gz && ${NODE_HOME}/bin/node -v && node -v && npm -v   && npm config set registry ${NODE_MIRROR}   && npm i -g nrm  ;; \
+        *) echo >&2 "unsupported architecture: ${dpkgArch}" ;; \
+    esac;
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y 
+RUN rustup target add $(arch)-unknown-linux-musl 
+RUN REPO=sjtug/ohmyzsh REMOTE=https://git.sjtu.edu.cn/${REPO}.git sh -c "$(curl -fsSL https://git.sjtu.edu.cn/sjtug/ohmyzsh/-/raw/master/tools/install.sh\?inline\=false)" \
+&& sed -i "s@/bin/bash@/bin/zsh@" /etc/passwd \
+  && echo export "LANG=\"C.UTF-8\"" >> /root/.zshrc \
+  && echo export "LC_ALL=\"C.UTF-8\"" >> /root/.zshrc \
+  && echo "setopt no_nomatch" >> /root/.zshrc \
+  && echo "setopt histignorespace" >> /root/.zshrc \
+  && echo "export LESSCHARSET=utf-8" >> /root/.zshrc \
+
+
+
+RUN echo "export CARGO_HOME=${CARGO_HOME}" >> /etc/profile \
+    && echo "export RUSTUP_HOME=${RUSTUP_HOME}" >> /etc/profile \
+    && v=$(rustc --version | awk '{print $2}') \
+    && echo "export RUST_VERSION=$v" >> /etc/profile \
+    && echo "export PATH=${PATH}" >> /etc/profile \
+    && echo "export CARGO_HOME=${CARGO_HOME}" >> /root/.zshrc \
+    && echo "export RUSTUP_HOME=${RUSTUP_HOME}" >> /root/.zshrc \
+    && echo "export RUST_VERSION=$v" >> /root/.zshrc \
+    && echo "export PATH=${PATH}" >> /root/.zshrc
+RUN  sed -i "s@VNCPORT@VNCDISPLAY@g" /app/tiger.sh && sed -i "s@-fg@-fg -desktop \${VNCNAME} -rfbport \${VNCPORT}@g" /app/tiger.sh 
+RUN sh /app/scripts/prepare_firefox_ppa.sh && apt update -y && apt install -y firefox
+RUN apt install -y gcc g++ make pkg-config libssl-dev unzip bsdmainutils unzip python3.11-full libegl1 libopengl0 libxcb-cursor0 xz-utils libglx0 libxkbcommon0 librust-glib-dev libwebkit2gtk-4.1-dev \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libxdo-dev \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  xdg-utils \
+  librust-glib-dev
