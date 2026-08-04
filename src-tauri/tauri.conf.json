@@ -13,7 +13,7 @@
     "windows": [
       {
         "title": "mkv",
-        "width": 800,
+        "width": 900,
         "height": 600,
         "center": true,
         "decorations": false,

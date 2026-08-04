@@ -23,8 +23,8 @@ fn main() {
     tauri_build::build();
 }
 
-fn copy_resource()-> Result<(), Box<dyn std::error::Error>>{
-        // ffmpeg 作为资源文件 而非侧车进程的处理逻辑
+fn copy_resource() -> Result<(), Box<dyn std::error::Error>> {
+    // ffmpeg 作为资源文件 而非侧车进程的处理逻辑
     let target = env::var("TARGET")?;
     let extension = if target.contains("windows") {
         ".exe"
@@ -33,7 +33,7 @@ fn copy_resource()-> Result<(), Box<dyn std::error::Error>>{
     };
     let binaries_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("binaries");
     let ffmpeg = binaries_dir.join(format!("ffm-{target}{extension}"));
-    fs::copy(ffmpeg, &binaries_dir.join(format!("ffm")))?;
+    fs::copy(ffmpeg, binaries_dir.join("ffm"))?;
     Ok(())
 }
 
@@ -188,7 +188,10 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&binaries_dir)?;
     let archive_name = archive_name(&target)?;
     let url = format!("{RELEASE_URL}/{archive_name}");
-    println!("cargo:warning=Downloading FFmpeg sidecars for {target} from Github, url = {}",url);
+    println!(
+        "cargo:warning=Downloading FFmpeg sidecars for {target} from Github, url = {}",
+        url
+    );
     let response = ureq::get(&url).call()?;
     let mut archive = Vec::new();
     response.into_reader().read_to_end(&mut archive)?;
