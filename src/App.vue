@@ -14,6 +14,8 @@ const loading = ref(false);
 const saving = ref(false);
 const error = ref("");
 const notice = ref("");
+const languageMenuOpen = ref(false);
+const languagePickerElement = ref(null);
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
 const languageNames = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "language" })
@@ -55,9 +57,59 @@ const subtitleContent = computed({
   set: (content) => {
     if (!activeTab.value) return;
     activeTab.value.content = content;
-    activeTab.value.dirty = content !== activeTab.value.originalContent;
+    updateTabDirty(activeTab.value);
   },
 });
+const subtitleLanguage = computed({
+  get: () => activeTab.value?.language ?? "",
+  set: (language) => {
+    if (!activeTab.value) return;
+    activeTab.value.language = language;
+    updateTabDirty(activeTab.value);
+  },
+});
+const subtitleTitle = computed({
+  get: () => activeTab.value?.title ?? "",
+  set: (title) => {
+    if (!activeTab.value) return;
+    activeTab.value.title = title;
+    updateTabDirty(activeTab.value);
+  },
+});
+
+const supportedSubtitleLanguages = [
+  { value: "chi", label: "中文" },
+  { value: "eng", label: "英语" },
+  { value: "jpn", label: "日文" },
+];
+
+const subtitleLanguageLabel = computed(() => {
+  const language = subtitleLanguage.value;
+  if (!language) return "未指定";
+  const supported = supportedSubtitleLanguages.find((option) => option.value === language);
+  return supported?.label ?? `${readableLanguage(language)} (${language})`;
+});
+
+function updateTabDirty(tab) {
+  tab.dirty = tab.content !== tab.originalContent ||
+    tab.language !== tab.originalLanguage ||
+    tab.title !== tab.originalTitle;
+}
+
+function toggleLanguageMenu() {
+  languageMenuOpen.value = !languageMenuOpen.value;
+}
+
+function selectSubtitleLanguage(language) {
+  subtitleLanguage.value = language;
+  languageMenuOpen.value = false;
+}
+
+function closeLanguageMenu(event) {
+  if (event.key === "Escape" || !languagePickerElement.value?.contains(event.target)) {
+    languageMenuOpen.value = false;
+  }
+}
 
 function showError(message) {
   error.value = typeof message === "string" ? message : String(message);
@@ -120,6 +172,10 @@ async function selectStream(stream) {
       subtitle: document,
       originalContent: document.content,
       content: document.content,
+      originalLanguage: stream.language ?? "",
+      language: stream.language ?? "",
+      originalTitle: stream.title ?? "",
+      title: stream.title ?? "",
       dirty: false,
     };
     const replaceIndex = editorTabs.value.findIndex((candidate) => !candidate.dirty);
@@ -171,7 +227,12 @@ async function saveSubtitle() {
   if (!media.value) return;
   const edits = editorTabs.value
     .filter((tab) => tab.dirty)
-    .map((tab) => ({ streamIndex: tab.stream.index, content: tab.content }));
+    .map((tab) => ({
+      streamIndex: tab.stream.index,
+      content: tab.content,
+      ...(tab.language !== tab.originalLanguage ? { language: tab.language } : {}),
+      ...(tab.title !== tab.originalTitle ? { title: tab.title } : {}),
+    }));
   if (!edits.length) {
     showError("没有需要导出的字幕修改。");
     return;
@@ -190,6 +251,9 @@ async function saveSubtitle() {
     for (const tab of editorTabs.value) {
       if (tab.dirty) {
         tab.originalContent = tab.content;
+        tab.originalLanguage = tab.language;
+        tab.originalTitle = tab.title;
+        tab.stream.title = tab.title;
         tab.dirty = false;
       }
     }
@@ -321,6 +385,8 @@ function shiftSubtitles(direction) {
 }
 
 onMounted(async () => {
+  document.addEventListener("pointerdown", closeLanguageMenu);
+  document.addEventListener("keydown", closeLanguageMenu);
   unlistenDrop = await getCurrentWindow().onDragDropEvent((event) => {
     if (event.payload.type === "drop") loadFile(event.payload.paths[0]);
   });
@@ -328,6 +394,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   unlistenDrop?.();
+  document.removeEventListener("pointerdown", closeLanguageMenu);
+  document.removeEventListener("keydown", closeLanguageMenu);
   if (subtitleTabsScrollFrame) cancelAnimationFrame(subtitleTabsScrollFrame);
 });
 </script>
@@ -415,12 +483,17 @@ onBeforeUnmount(() => {
       <section class="editor-panel">
         <template v-if="subtitle">
           <div class="editor-header">
-            <div>
+            <div class="editor-heading">
               <h2>{{ streamLabel(selectedStream) }} · {{ subtitle.codecName }}</h2>
             </div>
-            <button class="primary" :disabled="busy" @click="saveSubtitle">
-              {{ saving ? "正在重新混流…" : "导出 MKV" }}
-            </button>
+            <div class="editor-actions">
+              <label class="subtitle-title-field">
+                <input v-model="subtitleTitle" :disabled="busy" type="text" aria-label="字幕标题" placeholder="未命名" />
+              </label>
+              <button class="primary" :disabled="busy" @click="saveSubtitle">
+                {{ saving ? "正在重新混流…" : "导出 MKV" }}
+              </button>
+            </div>
           </div>
           <div class="timestamp-toolbar">
             <span>时间戳偏移</span>
@@ -428,6 +501,35 @@ onBeforeUnmount(() => {
             <input v-model.number="timestampOffset" type="input" aria-label="时间戳偏移毫秒" />
             <span>ms</span>
             <button @click="shiftSubtitles(1)">推迟</button>
+            <div ref="languagePickerElement" class="subtitle-language" :class="{ open: languageMenuOpen }">
+              <span>语言</span>
+              <button
+                class="language-picker-trigger"
+                type="button"
+                role="combobox"
+                aria-haspopup="listbox"
+                :aria-expanded="languageMenuOpen"
+                aria-controls="subtitle-language-options"
+                @click="toggleLanguageMenu"
+              >
+                <span class="language-picker-label">{{ subtitleLanguageLabel }}</span>
+                <span class="language-picker-arrow" aria-hidden="true"></span>
+              </button>
+              <div v-if="languageMenuOpen" id="subtitle-language-options" class="language-picker-menu" role="listbox" aria-label="字幕语言">
+                <button
+                  v-for="option in supportedSubtitleLanguages"
+                  :key="option.value"
+                  class="language-picker-option"
+                  :class="{ selected: subtitleLanguage === option.value }"
+                  type="button"
+                  role="option"
+                  :aria-selected="subtitleLanguage === option.value"
+                  @click="selectSubtitleLanguage(option.value)"
+                >
+                  {{ option.label }}
+                </button>
+              </div>
+            </div>
           </div>
           <div class="timestamp-start-row">
             <div class="timestamp-start-controls">
@@ -507,7 +609,7 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
 .sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-logo { width: 34px; height: 34px; flex: 0 0 34px; object-fit: contain; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }
 .stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; }.stream-row:hover { background: #1a2740; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
-.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-header h2 { margin: 0 0 4px; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-header .primary { padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { min-width: 0; align-items: flex-end; padding-top: 6px; padding-bottom: 0; border-bottom: 1px solid #2b3855; }.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 9px; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }.subtitle-tabs { align-self: stretch; min-width: 0; display: flex; flex: 1; align-items: flex-end; gap: 0; overflow-x: auto; scrollbar-width: none; }.subtitle-tabs::-webkit-scrollbar { display: none; }.subtitle-tab { position: relative; z-index: 0; flex: 0 0 auto; max-width: 132px; margin: 0 0 -1px -1px; overflow: hidden; border: 1px solid #33486e; border-bottom-color: #2b3855; border-radius: 5px 5px 0 0; padding: 7px 9px 8px; color: #9eafcf; background: #18243a; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }.subtitle-tab:first-child { margin-left: 0; }.subtitle-tab:hover { z-index: 1; border-color: #536987; color: #dbe7ff; background: #223451; }.subtitle-tab.active { z-index: 2; border-color: #6d92d6; border-bottom: 0; padding-bottom: 9px; color: #edf3ff; background: #101827; }.subtitle-tab.dirty { color: #d8f1a6; }.subtitle-tab span { margin-left: 3px; color: #7fe2b7; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
+.editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-heading { min-width: 0; flex: 1; }.editor-header h2 { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-actions { display: flex; flex: 0 1 auto; align-items: flex-end; gap: 10px; }.subtitle-title-field { min-width: 0; display: grid; gap: 3px; color: #a9b6cf; font-size: .72rem; }.subtitle-title-field input { width: min(240px, 28vw); min-width: 120px; padding: 5px 7px; border: 1px solid #425a87; border-radius: 5px; color: #e5edff; background: #101827; }.subtitle-title-field input:focus { outline: 2px solid #7fe2b7; outline-offset: 1px; }.editor-header .primary { flex: 0 0 auto; padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { min-width: 0; align-items: flex-end; padding-top: 6px; padding-bottom: 0; border-bottom: 1px solid #2b3855; }.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 9px; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }.subtitle-tabs { align-self: stretch; min-width: 0; display: flex; flex: 1; align-items: flex-end; gap: 0; overflow-x: auto; scrollbar-width: none; }.subtitle-tabs::-webkit-scrollbar { display: none; }.subtitle-tab { position: relative; z-index: 0; flex: 0 0 auto; max-width: 132px; margin: 0 0 -1px -1px; overflow: hidden; border: 1px solid #33486e; border-bottom-color: #2b3855; border-radius: 5px 5px 0 0; padding: 7px 9px 8px; color: #9eafcf; background: #18243a; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }.subtitle-tab:first-child { margin-left: 0; }.subtitle-tab:hover { z-index: 1; border-color: #536987; color: #dbe7ff; background: #223451; }.subtitle-tab.active { z-index: 2; border-color: #6d92d6; border-bottom: 0; padding-bottom: 9px; color: #edf3ff; background: #101827; }.subtitle-tab.dirty { color: #d8f1a6; }.subtitle-tab span { margin-left: 3px; color: #7fe2b7; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
 .timestamp-start-row { border-bottom: 0; }
 .timestamp-start-row { position: relative; gap: 8px; }
 .timestamp-start-controls { position: relative; align-self: stretch; display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
@@ -516,4 +618,15 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .subtitle-tabs { overflow-y: hidden; }
 .subtitle-tabs::after { content: ""; flex: 1 0 0; align-self: flex-end; border-bottom: 1px solid #2b3855; }
 .subtitle-tab { margin-bottom: 0; }
+.subtitle-language { position: relative; display: flex; align-items: center; gap: 6px; margin-left: 6px; }
+.language-picker-trigger { width: 108px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; text-align: left; }
+.language-picker-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.language-picker-trigger:hover, .subtitle-language.open .language-picker-trigger { border-color: #6d92d6; background: #18243a; }
+.language-picker-trigger:focus-visible, .language-picker-option:focus-visible { outline: 2px solid #7fe2b7; outline-offset: 1px; }
+.language-picker-arrow { width: 6px; height: 6px; flex: 0 0 6px; border-right: 1px solid #a9b6cf; border-bottom: 1px solid #a9b6cf; transform: rotate(45deg) translateY(-2px); transition: transform .15s ease; }
+.subtitle-language.open .language-picker-arrow { transform: rotate(225deg) translate(-2px, -1px); }
+.language-picker-menu { position: absolute; z-index: 4; top: calc(100% + 5px); right: 0; width: 108px; overflow: hidden; border: 1px solid #536987; border-radius: 5px; padding: 3px; background: #101827; box-shadow: 0 10px 22px #0008; }
+.language-picker-option { width: 100%; border: 0; border-radius: 3px; padding: 6px 7px; color: #cbd7ec; background: transparent; text-align: left; }
+.language-picker-option:hover, .language-picker-option:focus-visible { color: #edf3ff; background: #253b60; }
+.language-picker-option.selected { color: #d8f1a6; background: #1d3840; }
 </style>

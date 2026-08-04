@@ -62,6 +62,8 @@ struct SubtitleDocument {
 struct SubtitleEdit {
     stream_index: u32,
     content: String,
+    language: Option<String>,
+    title: Option<String>,
 }
 
 struct SubtitleServer {
@@ -549,6 +551,8 @@ mod tests {
                 &[SubtitleEdit {
                     stream_index,
                     content: subtitle.content,
+                    language: None,
+                    title: None,
                 }],
             )
             .expect("FFmpeg 应能重新混流测试字幕");
@@ -705,6 +709,24 @@ impl FfmpegService for CliFfmpegService {
             command
                 .arg(format!("-map_metadata:s:{output_index}"))
                 .arg(format!("0:s:{}", candidate.index));
+            if let Some(language) = edits
+                .iter()
+                .find(|edit| edit.stream_index == candidate.index)
+                .and_then(|edit| edit.language.as_deref())
+            {
+                command
+                    .arg(format!("-metadata:s:{output_index}"))
+                    .arg(format!("language={language}"));
+            }
+            if let Some(title) = edits
+                .iter()
+                .find(|edit| edit.stream_index == candidate.index)
+                .and_then(|edit| edit.title.as_deref())
+            {
+                command
+                    .arg(format!("-metadata:s:{output_index}"))
+                    .arg(format!("title={title}"));
+            }
         }
 
         command
@@ -1081,7 +1103,20 @@ impl FfmpegService for FFIFfmpegService {
                 .add_stream_with(&context)
                 .map_err(|error| format!("无法创建输出流：{error}"))?;
             output_stream.set_time_base(stream.time_base());
-            output_stream.set_metadata(stream.metadata().to_owned());
+            let mut metadata = stream.metadata().to_owned();
+            if let Some(language) = replacements
+                .get(&stream.index())
+                .and_then(|edit| edit.language.as_deref())
+            {
+                metadata.set("language", language);
+            }
+            if let Some(title) = replacements
+                .get(&stream.index())
+                .and_then(|edit| edit.title.as_deref())
+            {
+                metadata.set("title", title);
+            }
+            output_stream.set_metadata(metadata);
         }
         output
             .write_header()
