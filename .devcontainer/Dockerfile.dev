@@ -80,4 +80,5 @@ RUN apt install -y gcc g++ make pkg-config libssl-dev unzip bsdmainutils unzip p
   libayatana-appindicator3-dev \
   librsvg2-dev \
   xdg-utils \
-  librust-glib-dev
+  librust-glib-dev \
+  libavutil-dev libavcodec-dev libavformat-dev clang ffmpeg
