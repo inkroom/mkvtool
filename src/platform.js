@@ -38,6 +38,10 @@ const mockSubtitles = [
   },
 ];
 
+for (const stream of mockMedia.streams) {
+  if (stream.editable) stream.subtitle = structuredClone(mockSubtitles[(stream.index - 2) % mockSubtitles.length]);
+}
+
 async function invokeMock(command, arguments_) {
   switch (command) {
     case "pick_mkv_file":

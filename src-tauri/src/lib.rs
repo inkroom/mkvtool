@@ -37,6 +37,7 @@ struct MediaStream {
     default_stream: bool,
     forced: bool,
     editable: bool,
+    subtitle: Option<SubtitleDocument>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -50,7 +51,7 @@ enum MediaStreamType {
     Unknown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SubtitleDocument {
     content: String,
@@ -96,6 +97,16 @@ fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static st
 #[cfg(feature = "embe")]
 #[derive(Clone)]
 struct FFIFfmpegService;
+
+#[cfg(feature = "embe")]
+struct FfiSubtitleReader {
+    stream_index: usize,
+    document: SubtitleDocument,
+    ass_uses_crlf: bool,
+    time_base: ffmpeg_next::Rational,
+    decoder: ffmpeg_next::decoder::Subtitle,
+    subtitle_number: usize,
+}
 
 #[cfg(feature = "embe")]
 impl FFIFfmpegService {
@@ -256,6 +267,107 @@ impl FFIFfmpegService {
         html.push_str(remaining);
         html.replace("\\N", "\n").replace("\\n", "\n")
     }
+
+    fn read_subtitles(
+        input: &mut ffmpeg_next::format::context::Input,
+        stream_indices: &[u32],
+    ) -> Result<HashMap<u32, SubtitleDocument>, String> {
+        if stream_indices.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let requested = stream_indices
+            .iter()
+            .map(|index| *index as usize)
+            .collect::<HashSet<_>>();
+        let mut readers = HashMap::new();
+
+        for stream in input.streams().filter(|stream| requested.contains(&stream.index())) {
+            let parameters = stream.parameters();
+            let codec_name = parameters.id().name().to_string();
+            let (format, _) = subtitle_specification(&codec_name)
+                .ok_or_else(|| "目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流。".to_string())?;
+            let content = if codec_name == "ass" {
+                Self::ass_header(&parameters)?
+            } else {
+                String::new()
+            };
+            let reader = FfiSubtitleReader {
+                stream_index: stream.index(),
+                ass_uses_crlf: content.contains("\r\n"),
+                document: SubtitleDocument {
+                    content,
+                    format: format.to_string(),
+                    codec_name,
+                },
+                time_base: stream.time_base(),
+                decoder: ffmpeg_next::codec::context::Context::from_parameters(parameters)
+                    .map_err(|error| format!("无法创建字幕解码器：{error}"))?
+                    .decoder()
+                    .subtitle()
+                    .map_err(|error| format!("无法打开字幕解码器：{error}"))?,
+                subtitle_number: 1,
+            };
+            readers.insert(reader.stream_index, reader);
+        }
+        if readers.len() != requested.len() {
+            return Err("未找到所选字幕流。".to_string());
+        }
+
+        for (packet_stream, packet) in input.packets() {
+            let Some(reader) = readers.get_mut(&packet_stream.index()) else {
+                continue;
+            };
+            let mut subtitle = ffmpeg_next::Subtitle::new();
+            if !reader.decoder.decode(&packet, &mut subtitle)
+                .map_err(|error| format!("无法解码字幕：{error}"))? {
+                continue;
+            }
+            for rect in subtitle.rects() {
+                match rect {
+                    ffmpeg_next::subtitle::Rect::Ass(rect) => {
+                        if reader.document.codec_name == "ass" {
+                            reader.document.content.push_str(&Self::ass_dialogue(
+                                rect.get(), packet.pts().unwrap_or_default(), packet.duration(), reader.time_base,
+                            ));
+                            if rect.get().ends_with("\r\n") { reader.document.content.push_str("\r\n"); }
+                            else if rect.get().ends_with('\n') { reader.document.content.push('\n'); }
+                        } else if reader.document.format == "srt" {
+                            reader.document.content.push_str(&format!(
+                                "{}\n{} --> {}\n{}\n\n", reader.subtitle_number,
+                                Self::srt_timestamp(packet.pts().unwrap_or_default(), reader.time_base),
+                                Self::srt_timestamp(packet.pts().unwrap_or_default().saturating_add(packet.duration()), reader.time_base),
+                                Self::ass_text_as_html(rect.get()),
+                            ));
+                            reader.subtitle_number += 1;
+                        } else {
+                            reader.document.content.push_str(rect.get());
+                        }
+                        if reader.document.codec_name != "ass" && !reader.document.content.ends_with('\n') {
+                            reader.document.content.push('\n');
+                        }
+                    }
+                    ffmpeg_next::subtitle::Rect::Text(rect) => {
+                        reader.document.content.push_str(rect.get());
+                        reader.document.content.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut documents = HashMap::new();
+        for reader in readers.into_values() {
+            let mut document = reader.document;
+            if document.codec_name == "ass" && !document.content.is_empty() {
+                document.content.push_str(if reader.ass_uses_crlf { "\r\n" } else { "\n" });
+            }
+            if document.content.is_empty() {
+                return Err("字幕流不包含可编辑的文本事件。".to_string());
+            }
+            documents.insert(reader.stream_index as u32, document);
+        }
+        Ok(documents)
+    }
 }
 
 #[cfg(feature = "embe")]
@@ -264,9 +376,9 @@ impl FfmpegService for FFIFfmpegService {
         use ffmpeg_next::format::stream::Disposition;
 
         Self::initialize()?;
-        let context = ffmpeg_next::format::input(path)
+        let mut context = ffmpeg_next::format::input(path)
             .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-        let streams = context
+        let mut streams = context
             .streams()
             .map(|stream| {
                 let parameters = stream.parameters();
@@ -307,9 +419,20 @@ impl FfmpegService for FFIFfmpegService {
                     default_stream: disposition.contains(Disposition::DEFAULT),
                     forced: disposition.contains(Disposition::FORCED),
                     editable,
+                    subtitle: None,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let subtitle_indices = streams
+            .iter()
+            .filter(|stream| stream.editable)
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        let subtitles = Self::read_subtitles(&mut context, &subtitle_indices)?;
+        for stream in &mut streams {
+            stream.subtitle = subtitles.get(&stream.index).cloned();
+        }
+
         let duration = (context.duration() >= 0)
             .then(|| (context.duration() as f64 / 1_000_000.0).to_string());
 
@@ -330,99 +453,8 @@ impl FfmpegService for FFIFfmpegService {
 
         let mut input = ffmpeg_next::format::input(path)
             .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-        let stream = input
-            .streams()
-            .find(|stream| stream.index() == stream_index as usize)
-            .ok_or_else(|| "未找到所选字幕流。".to_string())?;
-        let time_base = stream.time_base();
-        let parameters = stream.parameters();
-        let codec_name = parameters.id().name().to_string();
-        let mut content = if codec_name == "ass" {
-            Self::ass_header(&parameters)?
-        } else {
-            String::new()
-        };
-        let ass_uses_crlf = content.contains("\r\n");
-        let (format, _) = subtitle_specification(&codec_name)
-            .ok_or_else(|| "目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流。".to_string())?;
-        let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(parameters)
-            .map_err(|error| format!("无法创建字幕解码器：{error}"))?
-            .decoder()
-            .subtitle()
-            .map_err(|error| format!("无法打开字幕解码器：{error}"))?;
-        let mut subtitle_number = 1;
-
-        for (packet_stream, packet) in input.packets() {
-            if packet_stream.index() != stream_index as usize {
-                continue;
-            }
-            let mut subtitle = ffmpeg_next::Subtitle::new();
-            if decoder
-                .decode(&packet, &mut subtitle)
-                .map_err(|error| format!("无法解码字幕：{error}"))?
-            {
-                for rect in subtitle.rects() {
-                    match rect {
-                        ffmpeg_next::subtitle::Rect::Ass(rect) => {
-                            if codec_name == "ass" {
-                                content.push_str(&Self::ass_dialogue(
-                                    rect.get(),
-                                    packet.pts().unwrap_or_default(),
-                                    packet.duration(),
-                                    time_base,
-                                ));
-                                if rect.get().ends_with("\r\n") {
-                                    content.push_str("\r\n");
-                                } else if rect.get().ends_with('\n') {
-                                    content.push('\n');
-                                }
-                            } else if format == "srt" {
-                                content.push_str(&format!(
-                                    "{}\n{} --> {}\n{}\n\n",
-                                    subtitle_number,
-                                    Self::srt_timestamp(
-                                        packet.pts().unwrap_or_default(),
-                                        time_base
-                                    ),
-                                    Self::srt_timestamp(
-                                        packet
-                                            .pts()
-                                            .unwrap_or_default()
-                                            .saturating_add(packet.duration()),
-                                        time_base,
-                                    ),
-                                    Self::ass_text_as_html(rect.get()),
-                                ));
-                                subtitle_number += 1;
-                            } else {
-                                content.push_str(rect.get());
-                            }
-                            if codec_name != "ass" && !content.ends_with('\n') {
-                                content.push('\n');
-                            }
-                        }
-                        ffmpeg_next::subtitle::Rect::Text(rect) => {
-                            content.push_str(rect.get());
-                            content.push('\n');
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        if codec_name == "ass" && !content.is_empty() {
-            content.push_str(if ass_uses_crlf { "\r\n" } else { "\n" });
-        }
-
-        if content.is_empty() {
-            return Err("字幕流不包含可编辑的文本事件。".to_string());
-        }
-        Ok(SubtitleDocument {
-            content,
-            format: format.to_string(),
-            codec_name,
-        })
+        return Self::read_subtitles(&mut input, &[stream_index])
+            .and_then(|mut subtitles| subtitles.remove(&stream_index).ok_or_else(|| "未找到所选字幕流。".to_string()));
     }
 
     fn remux_subtitles(
@@ -885,9 +917,10 @@ impl FfmpegService for CliFfmpegService {
                     default_stream: disposition.default.unwrap_or(0) != 0,
                     forced: disposition.forced.unwrap_or(0) != 0,
                     editable,
+                    subtitle: None,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         Ok(MediaFile {
             path: path.display().to_string(),

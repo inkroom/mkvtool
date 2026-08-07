@@ -163,15 +163,17 @@ async function selectStream(stream) {
 
   loading.value = true;
   try {
-    const document = await invoke("read_subtitle", {
-      path: media.value.path,
-      streamIndex: stream.index,
-    });
+    if (!stream.subtitle) {
+      stream.subtitle = await invoke("read_subtitle", {
+        path: media.value.path,
+        streamIndex: stream.index,
+      });
+    }
     const tab = {
       stream,
-      subtitle: document,
-      originalContent: document.content,
-      content: document.content,
+      subtitle: stream.subtitle,
+      originalContent: stream.subtitle.content,
+      content: stream.subtitle.content,
       originalLanguage: stream.language ?? "",
       language: stream.language ?? "",
       originalTitle: stream.title ?? "",
