@@ -14,12 +14,6 @@ edition = "2021"
 name = "mkv_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-default = ["embe"]
-# Use the FFmpeg library API for media inspection. Enable with
-# `cargo build --features ffmpeg-next-service` on a host with FFmpeg development libraries.
-embe = ["dep:ffmpeg-next"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 tar = "0.4"
@@ -34,7 +28,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format"], optional = true }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format"] }
 
 [dev-dependencies]
 ureq = "2.12"

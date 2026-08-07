@@ -3,7 +3,6 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
-#[cfg(any(not(feature = "embe"), test))]
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -79,11 +78,46 @@ trait FfmpegService: Send + Sync {
     ) -> Result<(), String>;
 }
 
-#[cfg(feature = "embe")]
-type ActiveFfmpegService = FFIFfmpegService;
+enum ActiveFfmpegService {
+    Ffi(FFIFfmpegService),
+    Cli(CliFfmpegService),
+}
 
-#[cfg(not(feature = "embe"))]
-type ActiveFfmpegService = CliFfmpegService;
+impl ActiveFfmpegService {
+    fn new() -> Self {
+        CliFfmpegService::detect()
+            .map(Self::Cli)
+            .unwrap_or_else(|| Self::Ffi(FFIFfmpegService::new()))
+    }
+}
+
+impl FfmpegService for ActiveFfmpegService {
+    fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
+        match self {
+            Self::Ffi(service) => service.inspect(path),
+            Self::Cli(service) => service.inspect(path),
+        }
+    }
+
+    fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String> {
+        match self {
+            Self::Ffi(service) => service.read_subtitle(path, stream_index),
+            Self::Cli(service) => service.read_subtitle(path, stream_index),
+        }
+    }
+
+    fn remux_subtitles(
+        &self,
+        input: &Path,
+        output: &Path,
+        edits: &[SubtitleEdit],
+    ) -> Result<(), String> {
+        match self {
+            Self::Ffi(service) => service.remux_subtitles(input, output, edits),
+            Self::Cli(service) => service.remux_subtitles(input, output, edits),
+        }
+    }
+}
 
 fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static str)> {
     match codec_name {
@@ -94,11 +128,9 @@ fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static st
     }
 }
 
-#[cfg(feature = "embe")]
 #[derive(Clone)]
 struct FFIFfmpegService;
 
-#[cfg(feature = "embe")]
 struct FfiSubtitleReader {
     stream_index: usize,
     document: SubtitleDocument,
@@ -108,7 +140,6 @@ struct FfiSubtitleReader {
     subtitle_number: usize,
 }
 
-#[cfg(feature = "embe")]
 impl FFIFfmpegService {
     fn new() -> Self {
         Self
@@ -370,7 +401,6 @@ impl FFIFfmpegService {
     }
 }
 
-#[cfg(feature = "embe")]
 impl FfmpegService for FFIFfmpegService {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
         use ffmpeg_next::format::stream::Disposition;
@@ -548,16 +578,15 @@ impl FfmpegService for FFIFfmpegService {
     }
 }
 
-#[cfg(any(not(feature = "embe"), test))]
-struct CliFfmpegService;
+struct CliFfmpegService {
+    executable: PathBuf,
+}
 
-#[cfg(any(not(feature = "embe"), test))]
 struct SubtitleServer {
     base_url: String,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
-#[cfg(any(not(feature = "embe"), test))]
 impl SubtitleServer {
     fn start(edits: &[SubtitleEdit]) -> Result<Self, String> {
         let sources = edits
@@ -621,7 +650,6 @@ impl SubtitleServer {
         format!("{}/{stream_index}", self.base_url)
     }
 }
-#[cfg(any(not(feature = "embe"), test))]
 impl Drop for SubtitleServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
@@ -632,20 +660,17 @@ impl Drop for SubtitleServer {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[cfg(any(not(feature = "embe"), test))]
 struct ProbeResult {
     streams: Vec<ProbeStream>,
     format: Option<ProbeFormat>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[cfg(any(not(feature = "embe"), test))]
 struct ProbeFormat {
     duration: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[cfg(any(not(feature = "embe"), test))]
 struct ProbeStream {
     index: u32,
     codec_type: MediaStreamType,
@@ -656,25 +681,32 @@ struct ProbeStream {
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
-#[cfg(any(not(feature = "embe"), test))]
 struct StreamTags {
     title: Option<String>,
     language: Option<String>,
 }
-#[cfg(any(not(feature = "embe"), test))]
 #[derive(Debug, Default, serde::Deserialize)]
 struct Disposition {
     default: Option<u8>,
     forced: Option<u8>,
 }
 
-#[cfg(any(not(feature = "embe"), test))]
 use std::process::{Command, Stdio};
 
-#[cfg(any(not(feature = "embe"), test))]
 impl CliFfmpegService {
+    fn detect() -> Option<Self> {
+        let executable_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        ["ffmpeg", "ffmpeg.exe"]
+            .into_iter()
+            .map(|name| executable_dir.join(name))
+            .find(|path| path.is_file())
+            .map(|executable| Self { executable })
+    }
+
     fn new() -> Self {
-        Self
+        Self::detect().unwrap_or_else(|| Self {
+            executable: PathBuf::from("ffmpeg"),
+        })
     }
 
     fn ffmpeg_stream_type(&self, value: &str) -> Option<MediaStreamType> {
@@ -792,45 +824,8 @@ impl CliFfmpegService {
         })
     }
 
-    fn sidecar_command(&self, sidecar: &str) -> Result<Command, String> {
-        use std::fs;
-        if sidecar != "ffm" {
-            return Err(format!("不支持的内嵌命令：{sidecar}"));
-        }
-
-        let executable_name = if cfg!(target_os = "windows") {
-            format!("{}.exe", sidecar)
-        } else {
-            sidecar.to_string()
-        };
-        let executable_dir = std::env::current_exe()
-            .map_err(|error| format!("无法获取当前可执行文件路径：{error}"))?
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "无法获取当前可执行文件所在目录".to_string())?;
-        let destination = executable_dir.join(executable_name);
-
-        if !destination.is_file() {
-            fs::write(&destination, include_bytes!("../binaries/ffm")).map_err(|error| {
-                format!(
-                    "无法释放内嵌 {} 到 {}：{error}",
-                    sidecar,
-                    destination.display()
-                )
-            })?;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("无法设置 FFmpeg 执行权限：{error}"))?;
-        }
-        #[cfg(target_os = "windows")]
-        let mut cmd = Command::new(destination);
-        #[cfg(not(target_os = "windows"))]
-        let cmd = Command::new(destination);
+    fn ffmpeg_command(&self) -> Command {
+        let mut cmd = Command::new(&self.executable);
 
         #[cfg(target_os = "windows")]
         {
@@ -838,7 +833,7 @@ impl CliFfmpegService {
             // 0x08000000 是 CREATE_NO_WINDOW 的标志值
             cmd.creation_flags(0x08000000);
         }
-        Ok(cmd)
+        cmd
     }
     fn command_error(&self, command: &str, stderr: &[u8]) -> String {
         let detail = String::from_utf8_lossy(stderr).trim().to_string();
@@ -850,7 +845,7 @@ impl CliFfmpegService {
     }
     fn probe(&self, path: &Path) -> Result<ProbeResult, String> {
         let output = self
-            .sidecar_command("ffm")?
+            .ffmpeg_command()
             .args(["-hide_banner", "-i"])
             .arg(path)
             .output()
@@ -891,7 +886,6 @@ impl CliFfmpegService {
     }
 }
 
-#[cfg(any(not(feature = "embe"), test))]
 impl FfmpegService for CliFfmpegService {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
         let probe = self.probe(path)?;
@@ -940,7 +934,7 @@ impl FfmpegService for CliFfmpegService {
         let codec_name = stream.codec_name.as_deref().unwrap_or_default();
         let (format, _) = subtitle_specification(codec_name).unwrap();
         let output = self
-            .sidecar_command("ffm")?
+            .ffmpeg_command()
             .args(["-v", "error", "-i"])
             .arg(path)
             .args(["-map", &format!("0:{stream_index}"), "-f", format, "-"])
@@ -985,7 +979,7 @@ impl FfmpegService for CliFfmpegService {
 
         let subtitle_server = SubtitleServer::start(edits)?;
 
-        let mut command = self.sidecar_command("ffm")?;
+        let mut command = self.ffmpeg_command();
         command.args(["-v", "error", "-i"]).arg(input);
         for (edit, format) in edits.iter().zip(formats) {
             command

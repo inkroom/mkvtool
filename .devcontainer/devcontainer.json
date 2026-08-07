@@ -11,6 +11,7 @@
 			"extensions": [
 				"rust-lang.rust-analyzer",
 				"vadimcn.vscode-lldb",
+				"GitHub.vscode-github-actions",
 				"Natizyskunk.sftp",
 				"mikeburgh.xml-format",
 				"swellaby.vscode-rust-test-adapter"
