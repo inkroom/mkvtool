@@ -14,7 +14,8 @@
 				"GitHub.vscode-github-actions",
 				"Natizyskunk.sftp",
 				"mikeburgh.xml-format",
-				"swellaby.vscode-rust-test-adapter"
+				"swellaby.vscode-rust-test-adapter",
+				"Vue.volar"
 			]
 		}
 	},

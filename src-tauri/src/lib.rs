@@ -128,6 +128,12 @@ fn subtitle_specification(codec_name: &str) -> Option<(&'static str, &'static st
     }
 }
 
+fn canonical_codec_name(codec_name: &str) -> String {
+    subtitle_specification(codec_name)
+        .map(|(_, canonical_name)| canonical_name.to_string())
+        .unwrap_or_else(|| codec_name.to_string())
+}
+
 #[derive(Clone)]
 struct FFIFfmpegService;
 
@@ -312,9 +318,13 @@ impl FFIFfmpegService {
             .collect::<HashSet<_>>();
         let mut readers = HashMap::new();
 
-        for stream in input.streams().filter(|stream| requested.contains(&stream.index())) {
+        for stream in input
+            .streams()
+            .filter(|stream| requested.contains(&stream.index()))
+        {
             let parameters = stream.parameters();
-            let codec_name = parameters.id().name().to_string();
+            let source_codec_name = parameters.id().name();
+            let codec_name = canonical_codec_name(source_codec_name);
             let (format, _) = subtitle_specification(&codec_name)
                 .ok_or_else(|| "目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流。".to_string())?;
             let content = if codec_name == "ass" {
@@ -349,8 +359,11 @@ impl FFIFfmpegService {
                 continue;
             };
             let mut subtitle = ffmpeg_next::Subtitle::new();
-            if !reader.decoder.decode(&packet, &mut subtitle)
-                .map_err(|error| format!("无法解码字幕：{error}"))? {
+            if !reader
+                .decoder
+                .decode(&packet, &mut subtitle)
+                .map_err(|error| format!("无法解码字幕：{error}"))?
+            {
                 continue;
             }
             for rect in subtitle.rects() {
@@ -358,22 +371,40 @@ impl FFIFfmpegService {
                     ffmpeg_next::subtitle::Rect::Ass(rect) => {
                         if reader.document.codec_name == "ass" {
                             reader.document.content.push_str(&Self::ass_dialogue(
-                                rect.get(), packet.pts().unwrap_or_default(), packet.duration(), reader.time_base,
+                                rect.get(),
+                                packet.pts().unwrap_or_default(),
+                                packet.duration(),
+                                reader.time_base,
                             ));
-                            if rect.get().ends_with("\r\n") { reader.document.content.push_str("\r\n"); }
-                            else if rect.get().ends_with('\n') { reader.document.content.push('\n'); }
+                            if rect.get().ends_with("\r\n") {
+                                reader.document.content.push_str("\r\n");
+                            } else if rect.get().ends_with('\n') {
+                                reader.document.content.push('\n');
+                            }
                         } else if reader.document.format == "srt" {
                             reader.document.content.push_str(&format!(
-                                "{}\n{} --> {}\n{}\n\n", reader.subtitle_number,
-                                Self::srt_timestamp(packet.pts().unwrap_or_default(), reader.time_base),
-                                Self::srt_timestamp(packet.pts().unwrap_or_default().saturating_add(packet.duration()), reader.time_base),
+                                "{}\n{} --> {}\n{}\n\n",
+                                reader.subtitle_number,
+                                Self::srt_timestamp(
+                                    packet.pts().unwrap_or_default(),
+                                    reader.time_base
+                                ),
+                                Self::srt_timestamp(
+                                    packet
+                                        .pts()
+                                        .unwrap_or_default()
+                                        .saturating_add(packet.duration()),
+                                    reader.time_base
+                                ),
                                 Self::ass_text_as_html(rect.get()),
                             ));
                             reader.subtitle_number += 1;
                         } else {
                             reader.document.content.push_str(rect.get());
                         }
-                        if reader.document.codec_name != "ass" && !reader.document.content.ends_with('\n') {
+                        if reader.document.codec_name != "ass"
+                            && !reader.document.content.ends_with('\n')
+                        {
                             reader.document.content.push('\n');
                         }
                     }
@@ -390,7 +421,9 @@ impl FFIFfmpegService {
         for reader in readers.into_values() {
             let mut document = reader.document;
             if document.codec_name == "ass" && !document.content.is_empty() {
-                document.content.push_str(if reader.ass_uses_crlf { "\r\n" } else { "\n" });
+                document
+                    .content
+                    .push_str(if reader.ass_uses_crlf { "\r\n" } else { "\n" });
             }
             if document.content.is_empty() {
                 return Err("字幕流不包含可编辑的文本事件。".to_string());
@@ -421,11 +454,7 @@ impl FfmpegService for FFIFfmpegService {
                         let name = codec_id.name();
                         (name != "none").then(|| name.to_string())
                     })
-                    .map(|name| {
-                        subtitle_specification(&name)
-                            .map(|(_, canonical_name)| canonical_name.to_string())
-                            .unwrap_or(name)
-                    });
+                    .map(|name| canonical_codec_name(&name));
                 let codec_description = codec
                     .as_ref()
                     .map(|codec| codec.description().to_string())
@@ -483,8 +512,11 @@ impl FfmpegService for FFIFfmpegService {
 
         let mut input = ffmpeg_next::format::input(path)
             .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-        return Self::read_subtitles(&mut input, &[stream_index])
-            .and_then(|mut subtitles| subtitles.remove(&stream_index).ok_or_else(|| "未找到所选字幕流。".to_string()));
+        return Self::read_subtitles(&mut input, &[stream_index]).and_then(|mut subtitles| {
+            subtitles
+                .remove(&stream_index)
+                .ok_or_else(|| "未找到所选字幕流。".to_string())
+        });
     }
 
     fn remux_subtitles(
@@ -893,7 +925,7 @@ impl FfmpegService for CliFfmpegService {
             .streams
             .into_iter()
             .map(|stream| {
-                let codec_name = stream.codec_name;
+                let codec_name = stream.codec_name.map(|name| canonical_codec_name(&name));
                 let editable = stream.codec_type == MediaStreamType::Subtitle
                     && codec_name
                         .as_deref()
@@ -931,8 +963,9 @@ impl FfmpegService for CliFfmpegService {
     fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String> {
         let probe = self.probe(path)?;
         let stream = self.editable_stream(&probe, stream_index)?;
-        let codec_name = stream.codec_name.as_deref().unwrap_or_default();
-        let (format, _) = subtitle_specification(codec_name).unwrap();
+        let source_codec_name = stream.codec_name.as_deref().unwrap_or_default();
+        let codec_name = canonical_codec_name(source_codec_name);
+        let (format, _) = subtitle_specification(&codec_name).unwrap();
         let output = self
             .ffmpeg_command()
             .args(["-v", "error", "-i"])
@@ -950,7 +983,7 @@ impl FfmpegService for CliFfmpegService {
         Ok(SubtitleDocument {
             content,
             format: format.to_string(),
-            codec_name: codec_name.to_string(),
+            codec_name,
         })
     }
 
@@ -1111,28 +1144,74 @@ mod tests {
     fn assert_inspects_downloaded_test_file() {
         let _lock = ffmpeg_test_lock();
         let input = download_test_mkv().expect("测试文件应下载到 target 目录");
-        let service = ActiveFfmpegService::new();
-        let media = service.inspect(&input).expect("FFmpeg 应能探测测试文件");
+        let ffi = FFIFfmpegService::new();
+        let cli = CliFfmpegService::new();
+        let ffi_media = ffi.inspect(&input).expect("FFI FFmpeg 应能探测测试文件");
+        let cli_media = cli.inspect(&input).expect("FFmpeg CLI 应能探测测试文件");
 
-        assert!(!media.streams.is_empty());
-        assert!(media
+        assert!(!ffi_media.streams.is_empty());
+        assert_eq!(
+            ffi_media.streams.len(),
+            cli_media.streams.len(),
+            "两种 FFmpeg 实现返回的 stream 数量不一致"
+        );
+        assert!(ffi_media
             .streams
             .iter()
             .any(|stream| stream.stream_type == MediaStreamType::Video));
-        assert!(media
+        assert!(ffi_media
             .streams
             .iter()
             .any(|stream| stream.stream_type == MediaStreamType::Audio));
-        assert!(media
+        assert!(ffi_media
             .streams
             .iter()
             .any(|stream| stream.stream_type == MediaStreamType::Subtitle));
-        let subtitle = media
+        for (ffi_stream, cli_stream) in ffi_media.streams.iter().zip(&cli_media.streams) {
+            assert_eq!(
+                ffi_stream.index, cli_stream.index,
+                "stream 顺序或 index 不一致"
+            );
+            assert_eq!(
+                ffi_stream.stream_type, cli_stream.stream_type,
+                "stream #{} 类型不一致",
+                ffi_stream.index
+            );
+            assert_eq!(
+                ffi_stream.codec_name, cli_stream.codec_name,
+                "stream #{} codecname 不一致",
+                ffi_stream.index
+            );
+            assert_eq!(
+                ffi_stream.title, cli_stream.title,
+                "stream #{} title 不一致",
+                ffi_stream.index
+            );
+            assert_eq!(
+                ffi_stream.language, cli_stream.language,
+                "stream #{} language 不一致",
+                ffi_stream.index
+            );
+            assert_eq!(
+                ffi_stream.default_stream, cli_stream.default_stream,
+                "stream #{} default 标记不一致",
+                ffi_stream.index
+            );
+            assert_eq!(
+                ffi_stream.forced, cli_stream.forced,
+                "stream #{} forced 标记不一致",
+                ffi_stream.index
+            );
+            assert_eq!(
+                ffi_stream.editable, cli_stream.editable,
+                "stream #{} editable 标记不一致",
+                ffi_stream.index
+            );
+        }
+        assert!(ffi_media
             .streams
             .iter()
-            .find(|stream| stream.editable)
-            .expect("测试文件应包含可编辑字幕流");
-        assert_eq!(subtitle.codec_name.as_deref(), Some("ass"));
+            .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")));
     }
 
     #[test]
