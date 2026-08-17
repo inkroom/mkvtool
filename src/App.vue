@@ -16,6 +16,8 @@ const error = ref("");
 const notice = ref("");
 const languageMenuOpen = ref(false);
 const languagePickerElement = ref(null);
+const formatMenuOpen = ref(false);
+const formatPickerElement = ref(null);
 const fontAttachments = ref([]);
 const subsetFonts = ref(true);
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
@@ -78,6 +80,10 @@ const subtitleTitle = computed({
     updateTabDirty(activeTab.value);
   },
 });
+const subtitleFormat = computed({
+  get: () => activeTab.value?.format ?? "",
+  set: (format) => changeSubtitleFormat(format),
+});
 
 const supportedSubtitleLanguages = [
   { value: "chi", label: "中文" },
@@ -95,7 +101,8 @@ const subtitleLanguageLabel = computed(() => {
 function updateTabDirty(tab) {
   tab.dirty = tab.content !== tab.originalContent ||
     tab.language !== tab.originalLanguage ||
-    tab.title !== tab.originalTitle;
+    tab.title !== tab.originalTitle ||
+    tab.format !== tab.originalFormat;
 }
 
 function toggleLanguageMenu() {
@@ -107,9 +114,81 @@ function selectSubtitleLanguage(language) {
   languageMenuOpen.value = false;
 }
 
+const subtitleFormats = [
+  { value: "ass", label: "ass" },
+  { value: "srt", label: "srt" },
+];
+
+const subtitleFormatLabel = computed(() => subtitleFormats.find((option) => option.value === subtitleFormat.value)?.label ?? subtitleFormat.value);
+
+function toggleFormatMenu() {
+  formatMenuOpen.value = !formatMenuOpen.value;
+}
+
+function assTimestampToSrt(value) {
+  const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})[.:](\d{2})$/);
+  if (!match) return value.trim();
+  const [, hours, minutes, seconds, centiseconds] = match;
+  return `${hours.padStart(2, "0")}:${minutes}:${seconds},${centiseconds}0`;
+}
+
+function srtTimestampToAss(value) {
+  const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})[,.](\d{3})$/);
+  if (!match) return value.trim();
+  const [, hours, minutes, seconds, milliseconds] = match;
+  return `${Number(hours)}:${minutes}:${seconds}.${String(Math.floor(Number(milliseconds) / 10)).padStart(2, "0")}`;
+}
+
+function assToSrt(content) {
+  const entries = [];
+  for (const match of content.replace(/\r/g, "").matchAll(/^Dialogue:\s*(.*)$/gm)) {
+    const fields = match[1].split(",");
+    if (fields.length < 10) continue;
+    const text = fields.slice(9).join(",").replace(/\{[^}]*\}/g, "").replace(/\\[Nn]/g, "\n");
+    entries.push(`${assTimestampToSrt(fields[1])} --> ${assTimestampToSrt(fields[2])}\n${text}`);
+  }
+  return entries.map((entry, index) => `${index + 1}\n${entry}`).join("\n\n") + (entries.length ? "\n" : "");
+}
+
+function srtToAss(content) {
+  const entries = [];
+  const blocks = content.replace(/\r/g, "").trim().split(/\n\s*\n/);
+  for (const block of blocks) {
+    const lines = block.split("\n");
+    const timestampIndex = lines.findIndex((line) => /-->/.test(line));
+    if (timestampIndex < 0) continue;
+    const match = lines[timestampIndex].match(/([^\s]+)\s*-->\s*([^\s]+)/);
+    if (!match) continue;
+    const text = lines.slice(timestampIndex + 1).join("\\N").replace(/\r/g, "");
+    entries.push(`Dialogue: 0,${srtTimestampToAss(match[1])},${srtTimestampToAss(match[2])},Default,,0,0,0,,${text}`);
+  }
+  return `[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${entries.join("\n")}\n`;
+}
+
+function convertSubtitleFormat(content, from, to) {
+  if (from === to) return content;
+  return from === "ass" && to === "srt" ? assToSrt(content) : srtToAss(content);
+}
+
+function changeSubtitleFormat(format) {
+  if (!activeTab.value || !subtitleFormats.some((option) => option.value === format)) return;
+  const tab = activeTab.value;
+  if (tab.format !== format) {
+    tab.content = format === tab.originalFormat
+      ? tab.originalContent
+      : convertSubtitleFormat(tab.content, tab.format, format);
+    tab.format = format;
+    updateTabDirty(tab);
+  }
+  formatMenuOpen.value = false;
+}
+
 function closeLanguageMenu(event) {
   if (event.key === "Escape" || !languagePickerElement.value?.contains(event.target)) {
     languageMenuOpen.value = false;
+  }
+  if (event.key === "Escape" || !formatPickerElement.value?.contains(event.target)) {
+    formatMenuOpen.value = false;
   }
 }
 
@@ -152,9 +231,12 @@ async function chooseFontAttachment() {
   try {
     const path = await invoke("pick_font_file");
     if (!path || fontAttachments.value.some((font) => font.path === path)) return;
+    const name = path.split(/[\\/]/).pop() || path;
+    const fontName = await invoke("read_font_name", { path });
     fontAttachments.value.push({
       path,
-      name: path.split(/[\\/]/).pop() || path,
+      name,
+      fontName,
     });
   } catch (reason) {
     showError(reason);
@@ -196,6 +278,8 @@ async function selectStream(stream) {
       subtitle: stream.subtitle,
       originalContent: stream.subtitle.content,
       content: stream.subtitle.content,
+      originalFormat: stream.subtitle.format,
+      format: stream.subtitle.format,
       originalLanguage: stream.language ?? "",
       language: stream.language ?? "",
       originalTitle: stream.title ?? "",
@@ -263,6 +347,7 @@ async function saveSubtitle() {
       content: tab.content,
       ...(tab.language !== tab.originalLanguage ? { language: tab.language } : {}),
       ...(tab.title !== tab.originalTitle ? { title: tab.title } : {}),
+      ...(tab.format !== tab.originalFormat ? { format: tab.format } : {}),
     }));
   try {
     const defaultName = media.value.name.replace(/\.mkv$/i, "") + "-edited.mkv";
@@ -283,7 +368,9 @@ async function saveSubtitle() {
         tab.originalContent = tab.content;
         tab.originalLanguage = tab.language;
         tab.originalTitle = tab.title;
+        tab.originalFormat = tab.format;
         tab.stream.title = tab.title;
+        tab.subtitle.format = tab.format;
         tab.dirty = false;
       }
     }
@@ -391,7 +478,7 @@ function shiftSubtitles(direction) {
     showError("起始时间无效，请检查分、秒和毫秒。");
     return;
   }
-  if (subtitle.value.format === "ass") {
+  if (activeTab.value?.format === "ass") {
     subtitleContent.value = subtitleContent.value.replace(/^Dialogue:\s*([^\r\n]*)$/gm, (line, fields) => {
       const values = fields.split(",");
       if (values.length < 3) return line;
@@ -523,7 +610,10 @@ onBeforeUnmount(() => {
                 <span>字体子集化</span>
               </label>
               <div v-for="font in fontAttachments" :key="font.path" class="font-attachment">
-                <span :title="font.path">{{ font.name }}</span>
+                <span class="font-attachment-details" :title="font.path">
+                  <span v-if="font.fontName" class="font-attachment-name">{{ font.fontName }}</span>
+                  <span class="font-attachment-filename">{{ font.name }}</span>
+                </span>
                 <button type="button" :disabled="busy" :aria-label="`移除 ${font.name}`" title="移除字体" @click="removeFontAttachment(font.path)">×</button>
               </div>
             </div>
@@ -576,6 +666,35 @@ onBeforeUnmount(() => {
                   role="option"
                   :aria-selected="subtitleLanguage === option.value"
                   @click="selectSubtitleLanguage(option.value)"
+                >
+                  {{ option.label }}
+                </button>
+              </div>
+            </div>
+            <div ref="formatPickerElement" class="subtitle-language subtitle-format" :class="{ open: formatMenuOpen }">
+              <span>格式</span>
+              <button
+                class="language-picker-trigger"
+                type="button"
+                role="combobox"
+                aria-haspopup="listbox"
+                :aria-expanded="formatMenuOpen"
+                aria-controls="subtitle-format-options"
+                @click="toggleFormatMenu"
+              >
+                <span class="language-picker-label">{{ subtitleFormatLabel }}</span>
+                <span class="language-picker-arrow" aria-hidden="true"></span>
+              </button>
+              <div v-if="formatMenuOpen" id="subtitle-format-options" class="language-picker-menu" role="listbox" aria-label="字幕格式">
+                <button
+                  v-for="option in subtitleFormats"
+                  :key="option.value"
+                  class="language-picker-option"
+                  :class="{ selected: subtitleFormat === option.value }"
+                  type="button"
+                  role="option"
+                  :aria-selected="subtitleFormat === option.value"
+                  @click="changeSubtitleFormat(option.value)"
                 >
                   {{ option.label }}
                 </button>
@@ -660,7 +779,7 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
 .sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-logo { width: 34px; height: 34px; flex: 0 0 34px; object-fit: contain; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }
 .stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px 10px 34px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; cursor: pointer; }.stream-row:hover { background: #1a2740; }.stream-row:focus-visible { outline: 2px solid #7fe2b7; outline-offset: -2px; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-selection { position: absolute; top: 12px; left: 10px; display: grid; place-items: center; cursor: pointer; }.stream-selection input { width: 15px; height: 15px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }.stream-selection input:disabled { cursor: wait; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
-.font-attachments { display: grid; gap: 5px; margin: 5px 0 4px; padding: 0 8px; }.add-font-attachment { width: 100%; border: 1px dashed #536987; border-radius: 5px; padding: 6px 8px; color: #bcd0ee; background: #17243b; font-size: .73rem; text-align: left; }.add-font-attachment:hover { border-color: #7fe2b7; color: #e5fff3; background: #1b3245; }.font-attachment { min-width: 0; display: flex; align-items: center; gap: 5px; padding: 4px 5px 4px 7px; border: 1px solid #354969; border-radius: 5px; color: #aebcd5; background: #151f32; font-size: .7rem; }.font-attachment span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.font-attachment button { width: 19px; height: 19px; flex: 0 0 19px; padding: 0; border: 0; border-radius: 3px; color: #b8c7e1; background: transparent; font-size: 1rem; line-height: 1; }.font-attachment button:hover { color: #fff; background: #6a3441; }
+.font-attachments { display: grid; gap: 5px; margin: 5px 0 4px; padding: 0 8px; }.add-font-attachment { width: 100%; border: 1px dashed #536987; border-radius: 5px; padding: 6px 8px; color: #bcd0ee; background: #17243b; font-size: .73rem; text-align: left; }.add-font-attachment:hover { border-color: #7fe2b7; color: #e5fff3; background: #1b3245; }.font-attachment { min-width: 0; display: flex; align-items: center; gap: 5px; padding: 4px 5px 4px 7px; border: 1px solid #354969; border-radius: 5px; color: #aebcd5; background: #151f32; font-size: .7rem; }.font-attachment-details { min-width: 0; flex: 1; display: grid; gap: 1px; }.font-attachment-name, .font-attachment-filename { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.font-attachment-name { color: #d7e5fa; }.font-attachment-filename { color: #7f91b0; font-size: .66rem; }.font-attachment button { width: 19px; height: 19px; flex: 0 0 19px; padding: 0; border: 0; border-radius: 3px; color: #b8c7e1; background: transparent; font-size: 1rem; line-height: 1; }.font-attachment button:hover { color: #fff; background: #6a3441; }
 .font-subset-option { display: flex; align-items: center; gap: 6px; color: #bcd0ee; font-size: .73rem; cursor: pointer; }.font-subset-option input { width: 14px; height: 14px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }.font-subset-option input:disabled { cursor: wait; }
 .editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-heading { min-width: 0; flex: 1; }.editor-header h2 { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-actions { display: flex; flex: 0 1 auto; align-items: flex-end; gap: 10px; }.subtitle-title-field { min-width: 0; display: grid; gap: 3px; color: #a9b6cf; font-size: .72rem; }.subtitle-title-field input { width: min(240px, 28vw); min-width: 120px; padding: 5px 7px; border: 1px solid #425a87; border-radius: 5px; color: #e5edff; background: #101827; }.subtitle-title-field input:focus { outline: 2px solid #7fe2b7; outline-offset: 1px; }.editor-header .primary { flex: 0 0 auto; padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { min-width: 0; align-items: flex-end; padding-top: 6px; padding-bottom: 0; border-bottom: 1px solid #2b3855; }.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 9px; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }.subtitle-tabs { align-self: stretch; min-width: 0; display: flex; flex: 1; align-items: flex-end; gap: 0; overflow-x: auto; scrollbar-width: none; }.subtitle-tabs::-webkit-scrollbar { display: none; }.subtitle-tab { position: relative; z-index: 0; flex: 0 0 auto; max-width: 132px; margin: 0 0 -1px -1px; overflow: hidden; border: 1px solid #33486e; border-bottom-color: #2b3855; border-radius: 5px 5px 0 0; padding: 7px 9px 8px; color: #9eafcf; background: #18243a; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }.subtitle-tab:first-child { margin-left: 0; }.subtitle-tab:hover { z-index: 1; border-color: #536987; color: #dbe7ff; background: #223451; }.subtitle-tab.active { z-index: 2; border-color: #6d92d6; border-bottom: 0; padding-bottom: 9px; color: #edf3ff; background: #101827; }.subtitle-tab.dirty { color: #d8f1a6; }.subtitle-tab span { margin-left: 3px; color: #7fe2b7; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
 .timestamp-start-row { border-bottom: 0; }
@@ -672,13 +791,14 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .subtitle-tabs::after { content: ""; flex: 1 0 0; align-self: flex-end; border-bottom: 1px solid #2b3855; }
 .subtitle-tab { margin-bottom: 0; }
 .subtitle-language { position: relative; display: flex; align-items: center; gap: 6px; margin-left: 6px; }
-.language-picker-trigger { width: 108px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; text-align: left; }
+.language-picker-trigger { width: 62px; display: flex; align-items: center; justify-content: space-between; gap: 5px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 6px; color: #e5edff; background: #101827; text-align: left; }
 .language-picker-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .language-picker-trigger:hover, .subtitle-language.open .language-picker-trigger { border-color: #6d92d6; background: #18243a; }
 .language-picker-trigger:focus-visible, .language-picker-option:focus-visible { outline: 2px solid #7fe2b7; outline-offset: 1px; }
 .language-picker-arrow { width: 6px; height: 6px; flex: 0 0 6px; border-right: 1px solid #a9b6cf; border-bottom: 1px solid #a9b6cf; transform: rotate(45deg) translateY(-2px); transition: transform .15s ease; }
 .subtitle-language.open .language-picker-arrow { transform: rotate(225deg) translate(-2px, -1px); }
-.language-picker-menu { position: absolute; z-index: 4; top: calc(100% + 5px); right: 0; width: 108px; overflow: hidden; border: 1px solid #536987; border-radius: 5px; padding: 3px; background: #101827; box-shadow: 0 10px 22px #0008; }
+.language-picker-menu { position: absolute; z-index: 4; top: calc(100% + 5px); right: 0; width: 62px; overflow: hidden; border: 1px solid #536987; border-radius: 5px; padding: 3px; background: #101827; box-shadow: 0 10px 22px #0008; }
+.subtitle-format .language-picker-trigger, .subtitle-format .language-picker-menu { width: 55px; }
 .language-picker-option { width: 100%; border: 0; border-radius: 3px; padding: 6px 7px; color: #cbd7ec; background: transparent; text-align: left; }
 .language-picker-option:hover, .language-picker-option:focus-visible { color: #edf3ff; background: #253b60; }
 .language-picker-option.selected { color: #d8f1a6; background: #1d3840; }

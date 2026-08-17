@@ -48,6 +48,8 @@ async function invokeMock(command, arguments_) {
       return mockMedia.path;
     case "pick_font_file":
       return "/mock/fonts/DemoFont.ttf";
+    case "read_font_name":
+      return "Demo Font";
     case "inspect_mkv":
       return structuredClone(mockMedia);
     case "read_subtitle": {
