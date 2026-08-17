@@ -75,6 +75,21 @@ trait FfmpegService: Send + Sync {
         input: &Path,
         output: &Path,
         edits: &[SubtitleEdit],
+    ) -> Result<(), String> {
+        let selected_stream_indices = self
+            .inspect(input)?
+            .streams
+            .into_iter()
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        self.remux_selected_streams(input, output, edits, &selected_stream_indices)
+    }
+    fn remux_selected_streams(
+        &self,
+        input: &Path,
+        output: &Path,
+        edits: &[SubtitleEdit],
+        selected_stream_indices: &[u32],
     ) -> Result<(), String>;
 }
 
@@ -106,15 +121,16 @@ impl FfmpegService for ActiveFfmpegService {
         }
     }
 
-    fn remux_subtitles(
+    fn remux_selected_streams(
         &self,
         input: &Path,
         output: &Path,
         edits: &[SubtitleEdit],
+        selected_stream_indices: &[u32],
     ) -> Result<(), String> {
         match self {
-            Self::Ffi(service) => service.remux_subtitles(input, output, edits),
-            Self::Cli(service) => service.remux_subtitles(input, output, edits),
+            Self::Ffi(service) => service.remux_selected_streams(input, output, edits, selected_stream_indices),
+            Self::Cli(service) => service.remux_selected_streams(input, output, edits, selected_stream_indices),
         }
     }
 }
@@ -529,19 +545,24 @@ impl FfmpegService for FFIFfmpegService {
         });
     }
 
-    fn remux_subtitles(
+    fn remux_selected_streams(
         &self,
         input_path: &Path,
         output_path: &Path,
         edits: &[SubtitleEdit],
+        selected_stream_indices: &[u32],
     ) -> Result<(), String> {
         Self::initialize()?;
 
-        if edits.is_empty() {
-            return Err("没有需要导出的字幕修改。".to_string());
-        }
         let mut input = ffmpeg_next::format::input(input_path)
             .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+        let selected_streams = selected_stream_indices
+            .iter()
+            .map(|index| *index as usize)
+            .collect::<HashSet<_>>();
+        if selected_streams.is_empty() {
+            return Err("请至少选择一条要导出的流。".to_string());
+        }
         let mut replacements = HashMap::new();
         for edit in edits {
             if replacements
@@ -567,7 +588,11 @@ impl FfmpegService for FFIFfmpegService {
         let mut output = ffmpeg_next::format::output(output_path)
             .map_err(|error| format!("无法创建输出文件：{error}"))?;
         output.set_metadata(input.metadata().to_owned());
+        let mut output_indices = HashMap::new();
         for stream in input.streams() {
+            if !selected_streams.contains(&stream.index()) {
+                continue;
+            }
             let parameters = stream.parameters();
             let context = ffmpeg_next::codec::context::Context::from_parameters(parameters)
                 .map_err(|error| format!("无法复制流参数：{error}"))?;
@@ -589,6 +614,7 @@ impl FfmpegService for FFIFfmpegService {
                 metadata.set("title", title);
             }
             output_stream.set_metadata(metadata);
+            output_indices.insert(stream.index(), output_stream.index());
         }
         output
             .write_header()
@@ -597,10 +623,13 @@ impl FfmpegService for FFIFfmpegService {
         let mut emitted_replacements = HashSet::new();
         for (stream, packet) in input.packets() {
             let index = stream.index();
+            let Some(&output_index) = output_indices.get(&index) else {
+                continue;
+            };
             if let Some(edit) = replacements.get(&index) {
                 if emitted_replacements.insert(index) {
                     let mut replacement = ffmpeg_next::Packet::copy(edit.content.as_bytes());
-                    replacement.set_stream(index);
+                    replacement.set_stream(output_index);
                     replacement.set_pts(Some(0));
                     replacement.set_dts(Some(0));
                     replacement.set_duration(1);
@@ -610,6 +639,8 @@ impl FfmpegService for FFIFfmpegService {
                 }
                 continue;
             }
+            let mut packet = packet;
+            packet.set_stream(output_index);
             packet
                 .write_interleaved(&mut output)
                 .map_err(|error| format!("无法写入媒体数据：{error}"))?;
@@ -1002,17 +1033,18 @@ impl FfmpegService for CliFfmpegService {
         })
     }
 
-    fn remux_subtitles(
+    fn remux_selected_streams(
         &self,
         input: &Path,
         output: &Path,
         edits: &[SubtitleEdit],
+        selected_stream_indices: &[u32],
     ) -> Result<(), String> {
-        if edits.is_empty() {
-            return Err("没有需要导出的字幕修改。".to_string());
-        }
-
         let probe = self.probe(input)?;
+        let selected_streams = selected_stream_indices.iter().copied().collect::<HashSet<_>>();
+        if selected_streams.is_empty() {
+            return Err("请至少选择一条要导出的流。".to_string());
+        }
         let mut edited_streams = HashSet::new();
         let mut formats = Vec::with_capacity(edits.len());
         for edit in edits {
@@ -1025,18 +1057,21 @@ impl FfmpegService for CliFfmpegService {
             formats.push(format);
         }
 
-        let subtitle_server = SubtitleServer::start(edits)?;
+        let subtitle_server = (!edits.is_empty()).then(|| SubtitleServer::start(edits)).transpose()?;
 
         let mut command = self.ffmpeg_command();
         command.args(["-v", "error", "-i"]).arg(input);
         for (edit, format) in edits.iter().zip(formats) {
             command
                 .args(["-f", format, "-i"])
-                .arg(subtitle_server.url(edit.stream_index));
+                .arg(subtitle_server.as_ref().unwrap().url(edit.stream_index));
         }
 
         // Keep each source stream in its original order, replacing edited subtitle streams in place.
         for candidate in &probe.streams {
+            if !selected_streams.contains(&candidate.index) {
+                continue;
+            }
             command.arg("-map");
             if let Some((input_index, _)) = edits
                 .iter()
@@ -1050,7 +1085,12 @@ impl FfmpegService for CliFfmpegService {
         }
 
         command.args(["-map_metadata", "0"]);
-        for (output_index, candidate) in probe.streams.iter().enumerate() {
+        for (output_index, candidate) in probe
+            .streams
+            .iter()
+            .filter(|candidate| selected_streams.contains(&candidate.index))
+            .enumerate()
+        {
             command
                 .arg(format!("-map_metadata:s:{output_index}"))
                 .arg(format!("0:s:{}", candidate.index));
@@ -1224,16 +1264,16 @@ mod tests {
                     ffi_stream.index
                 );
             }
-            if cli_media
+
+            assert_eq!(cli_media
                 .streams
                 .iter()
-                .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass"))
-            {
-                assert!(ffi_media
+                .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")),
+                ffi_media
                     .streams
                     .iter()
-                    .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")));
-            }
+                    .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass"))
+            );
         }
     }
     #[test]
@@ -1414,6 +1454,7 @@ async fn save_subtitles(
     input_path: String,
     output_path: String,
     edits: Vec<SubtitleEdit>,
+    selected_stream_indices: Vec<u32>,
 ) -> Result<(), String> {
     let input = mkv_path(&input_path)?;
     let output = PathBuf::from(output_path);
@@ -1423,7 +1464,9 @@ async fn save_subtitles(
         return Err("输出文件必须使用 .mkv 扩展名。".to_string());
     }
     let service = ActiveFfmpegService::new();
-    tauri::async_runtime::spawn_blocking(move || service.remux_subtitles(&input, &output, &edits))
+    tauri::async_runtime::spawn_blocking(move || {
+        service.remux_selected_streams(&input, &output, &edits, &selected_stream_indices)
+    })
         .await
         .map_err(|error| format!("重新混流时出错：{error}"))?
 }
