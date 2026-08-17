@@ -134,6 +134,10 @@ fn canonical_codec_name(codec_name: &str) -> String {
         .unwrap_or_else(|| codec_name.to_string())
 }
 
+fn normalize_srt_line_endings(content: String) -> String {
+    content.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 #[derive(Clone)]
 struct FFIFfmpegService;
 
@@ -409,7 +413,10 @@ impl FFIFfmpegService {
                         }
                     }
                     ffmpeg_next::subtitle::Rect::Text(rect) => {
-                        reader.document.content.push_str(rect.get());
+                        reader
+                            .document
+                            .content
+                            .push_str(rect.get().trim_end_matches(['\r', '\n']));
                         reader.document.content.push('\n');
                     }
                     _ => {}
@@ -420,6 +427,9 @@ impl FFIFfmpegService {
         let mut documents = HashMap::new();
         for reader in readers.into_values() {
             let mut document = reader.document;
+            if document.format == "srt" {
+                document.content = normalize_srt_line_endings(document.content);
+            }
             if document.codec_name == "ass" && !document.content.is_empty() {
                 document
                     .content
@@ -980,6 +990,11 @@ impl FfmpegService for CliFfmpegService {
 
         let content = String::from_utf8(output.stdout)
             .map_err(|_| "字幕不是 UTF-8 文本，暂时无法在编辑器中打开。".to_string())?;
+        let content = if format == "srt" {
+            normalize_srt_line_endings(content)
+        } else {
+            content
+        };
         Ok(SubtitleDocument {
             content,
             format: format.to_string(),
@@ -1086,8 +1101,7 @@ mod tests {
         sync::{Mutex, MutexGuard, OnceLock},
     };
 
-    const TEST_MKV_URL: &str =
-        "https://github.com/inkroom/mkvtool/releases/download/resource/test.mkv";
+    const TEST_MKV_URL: &str = "https://github.com/inkroom/mkvtool/releases/download/resource/";
     static FFMPEG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn ffmpeg_test_lock() -> MutexGuard<'static, ()> {
@@ -1106,9 +1120,9 @@ mod tests {
             .ok_or_else(|| "无法定位 Cargo target 目录".into())
     }
 
-    fn download_test_mkv() -> Result<PathBuf, Box<dyn Error>> {
+    fn download_test_mkv(mkv: &str) -> Result<PathBuf, Box<dyn Error>> {
         let fixture_dir = test_target_dir()?.join("ffmpeg-test-fixtures");
-        let fixture = fixture_dir.join("test.mkv");
+        let fixture = fixture_dir.join(mkv);
         if fixture.is_file() && fixture.metadata()?.len() > 0 {
             return Ok(fixture);
         }
@@ -1118,7 +1132,7 @@ mod tests {
         let response = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(60))
             .build()
-            .get(TEST_MKV_URL)
+            .get(format!("{}{}", TEST_MKV_URL, mkv).as_str())
             .call()?;
         let mut reader = response.into_reader();
         let mut output = File::create(&temporary)?;
@@ -1143,152 +1157,166 @@ mod tests {
     #[test]
     fn assert_inspects_downloaded_test_file() {
         let _lock = ffmpeg_test_lock();
-        let input = download_test_mkv().expect("测试文件应下载到 target 目录");
-        let ffi = FFIFfmpegService::new();
-        let cli = CliFfmpegService::new();
-        let ffi_media = ffi.inspect(&input).expect("FFI FFmpeg 应能探测测试文件");
-        let cli_media = cli.inspect(&input).expect("FFmpeg CLI 应能探测测试文件");
+        let res = vec!["test.mkv", "test2.mkv"];
+        for m in res {
+            let input = download_test_mkv(m).expect("测试文件应下载到 target 目录");
+            let ffi = FFIFfmpegService::new();
+            let cli = CliFfmpegService::new();
+            let ffi_media = ffi.inspect(&input).expect("FFI FFmpeg 应能探测测试文件");
+            let cli_media = cli.inspect(&input).expect("FFmpeg CLI 应能探测测试文件");
 
-        assert!(!ffi_media.streams.is_empty());
-        assert_eq!(
-            ffi_media.streams.len(),
-            cli_media.streams.len(),
-            "两种 FFmpeg 实现返回的 stream 数量不一致"
-        );
-        assert!(ffi_media
-            .streams
-            .iter()
-            .any(|stream| stream.stream_type == MediaStreamType::Video));
-        assert!(ffi_media
-            .streams
-            .iter()
-            .any(|stream| stream.stream_type == MediaStreamType::Audio));
-        assert!(ffi_media
-            .streams
-            .iter()
-            .any(|stream| stream.stream_type == MediaStreamType::Subtitle));
-        for (ffi_stream, cli_stream) in ffi_media.streams.iter().zip(&cli_media.streams) {
+            assert!(!ffi_media.streams.is_empty());
             assert_eq!(
-                ffi_stream.index, cli_stream.index,
-                "stream 顺序或 index 不一致"
+                ffi_media.streams.len(),
+                cli_media.streams.len(),
+                "两种 FFmpeg 实现返回的 stream 数量不一致"
             );
-            assert_eq!(
-                ffi_stream.stream_type, cli_stream.stream_type,
-                "stream #{} 类型不一致",
-                ffi_stream.index
-            );
-            assert_eq!(
-                ffi_stream.codec_name, cli_stream.codec_name,
-                "stream #{} codecname 不一致",
-                ffi_stream.index
-            );
-            assert_eq!(
-                ffi_stream.title, cli_stream.title,
-                "stream #{} title 不一致",
-                ffi_stream.index
-            );
-            assert_eq!(
-                ffi_stream.language, cli_stream.language,
-                "stream #{} language 不一致",
-                ffi_stream.index
-            );
-            assert_eq!(
-                ffi_stream.default_stream, cli_stream.default_stream,
-                "stream #{} default 标记不一致",
-                ffi_stream.index
-            );
-            assert_eq!(
-                ffi_stream.forced, cli_stream.forced,
-                "stream #{} forced 标记不一致",
-                ffi_stream.index
-            );
-            assert_eq!(
-                ffi_stream.editable, cli_stream.editable,
-                "stream #{} editable 标记不一致",
-                ffi_stream.index
-            );
+            assert!(ffi_media
+                .streams
+                .iter()
+                .any(|stream| stream.stream_type == MediaStreamType::Video));
+            assert!(ffi_media
+                .streams
+                .iter()
+                .any(|stream| stream.stream_type == MediaStreamType::Audio));
+            assert!(ffi_media
+                .streams
+                .iter()
+                .any(|stream| stream.stream_type == MediaStreamType::Subtitle));
+            for (ffi_stream, cli_stream) in ffi_media.streams.iter().zip(&cli_media.streams) {
+                assert_eq!(
+                    ffi_stream.index, cli_stream.index,
+                    "stream 顺序或 index 不一致"
+                );
+                assert_eq!(
+                    ffi_stream.stream_type, cli_stream.stream_type,
+                    "stream #{} 类型不一致",
+                    ffi_stream.index
+                );
+                assert_eq!(
+                    ffi_stream.codec_name, cli_stream.codec_name,
+                    "stream #{} codecname 不一致",
+                    ffi_stream.index
+                );
+                assert_eq!(
+                    ffi_stream.title, cli_stream.title,
+                    "stream #{} title 不一致",
+                    ffi_stream.index
+                );
+                assert_eq!(
+                    ffi_stream.language, cli_stream.language,
+                    "stream #{} language 不一致",
+                    ffi_stream.index
+                );
+                assert_eq!(
+                    ffi_stream.default_stream, cli_stream.default_stream,
+                    "stream #{} default 标记不一致",
+                    ffi_stream.index
+                );
+                assert_eq!(
+                    ffi_stream.forced, cli_stream.forced,
+                    "stream #{} forced 标记不一致",
+                    ffi_stream.index
+                );
+                assert_eq!(
+                    ffi_stream.editable, cli_stream.editable,
+                    "stream #{} editable 标记不一致",
+                    ffi_stream.index
+                );
+            }
+            if cli_media
+                .streams
+                .iter()
+                .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass"))
+            {
+                assert!(ffi_media
+                    .streams
+                    .iter()
+                    .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")));
+            }
         }
-        assert!(ffi_media
-            .streams
-            .iter()
-            .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")));
     }
-
     #[test]
     fn assert_reads_subtitle_from_downloaded_test_file() {
         let _lock = ffmpeg_test_lock();
-        let input = download_test_mkv().expect("测试文件应下载到 target 目录");
-        let service = ActiveFfmpegService::new();
-        let ffmpeg = CliFfmpegService::new();
-        let streams = service
-            .inspect(&input)
-            .expect("FFmpeg 应能探测测试文件")
-            .streams;
-        let editable_streams = streams.iter().filter(|stream| stream.editable);
+        let res = vec!["test.mkv", "test2.mkv"];
+        for m in res {
+            let input = download_test_mkv(m).expect("测试文件应下载到 target 目录");
+            let service = ActiveFfmpegService::new();
+            let ffmpeg = CliFfmpegService::new();
+            let streams = service
+                .inspect(&input)
+                .expect("FFmpeg 应能探测测试文件")
+                .streams;
+            let editable_streams = streams.iter().filter(|stream| stream.editable);
 
-        assert!(
-            editable_streams.clone().next().is_some(),
-            "测试文件应包含可编辑字幕流"
-        );
-        for stream in editable_streams {
-            let subtitle = service
-                .read_subtitle(&input, stream.index)
-                .expect("FFI FFmpeg 应能读取测试字幕");
-            let ffmpeg_subtitle = ffmpeg
-                .read_subtitle(&input, stream.index)
-                .expect("FFmpeg CLI 应能读取测试字幕");
+            assert!(
+                editable_streams.clone().next().is_some(),
+                "测试文件应包含可编辑字幕流"
+            );
+            for stream in editable_streams {
+                let subtitle = service
+                    .read_subtitle(&input, stream.index)
+                    .expect("FFI FFmpeg 应能读取测试字幕");
+                let ffmpeg_subtitle = ffmpeg
+                    .read_subtitle(&input, stream.index)
+                    .expect("FFmpeg CLI 应能读取测试字幕");
 
-            assert_eq!(
-                subtitle.format, ffmpeg_subtitle.format,
-                "字幕流 #{} 格式不一致",
-                stream.index
-            );
-            assert_eq!(
-                subtitle.codec_name, ffmpeg_subtitle.codec_name,
-                "字幕流 #{} 编码不一致",
-                stream.index
-            );
-            assert_eq!(
-                subtitle.content, ffmpeg_subtitle.content,
-                "字幕流 #{} 文本不一致",
-                stream.index
-            );
+                assert_eq!(
+                    subtitle.format, ffmpeg_subtitle.format,
+                    "字幕流 #{} 格式不一致",
+                    stream.index
+                );
+                assert_eq!(
+                    subtitle.codec_name, ffmpeg_subtitle.codec_name,
+                    "字幕流 #{} 编码不一致",
+                    stream.index
+                );
+                assert_eq!(
+                    subtitle.content, ffmpeg_subtitle.content,
+                    "字幕流 #{} 文本不一致",
+                    stream.index
+                );
+            }
         }
     }
 
     #[test]
     fn assert_remuxes_subtitle_from_downloaded_test_file() {
         let _lock = ffmpeg_test_lock();
-        let input = download_test_mkv().expect("测试文件应下载到 target 目录");
-        let service = ActiveFfmpegService::new();
-        let stream_index =
-            first_editable_subtitle(&service, &input).expect("测试文件应包含可编辑字幕流");
-        let subtitle = service
-            .read_subtitle(&input, stream_index)
-            .expect("FFmpeg 应能读取测试字幕");
-        let output = test_target_dir()
-            .expect("应能定位 Cargo target 目录")
-            .join("ffmpeg-test-fixtures")
-            .join("remuxed-test.mkv");
+        let res = vec!["test.mkv", "test2.mkv"];
+        for m in res {
+            let input = download_test_mkv(m).expect("测试文件应下载到 target 目录");
+            let service = ActiveFfmpegService::new();
+            let stream_index =
+                first_editable_subtitle(&service, &input).expect("测试文件应包含可编辑字幕流");
+            let subtitle = service
+                .read_subtitle(&input, stream_index)
+                .expect("FFmpeg 应能读取测试字幕");
+            let output = test_target_dir()
+                .expect("应能定位 Cargo target 目录")
+                .join("ffmpeg-test-fixtures")
+                .join("remuxed-test.mkv");
 
-        service
-            .remux_subtitles(
-                &input,
-                &output,
-                &[SubtitleEdit {
-                    stream_index,
-                    content: subtitle.content,
-                    language: None,
-                    title: None,
-                }],
-            )
-            .expect("FFmpeg 应能重新混流测试字幕");
+            service
+                .remux_subtitles(
+                    &input,
+                    &output,
+                    &[SubtitleEdit {
+                        stream_index,
+                        content: subtitle.content,
+                        language: None,
+                        title: None,
+                    }],
+                )
+                .expect("FFmpeg 应能重新混流测试字幕");
 
-        let remuxed = service.inspect(&output).expect("FFmpeg 应能探测重混流结果");
-        assert_eq!(
-            remuxed.streams.len(),
-            service.inspect(&input).unwrap().streams.len()
-        );
+            let remuxed = service.inspect(&output).expect("FFmpeg 应能探测重混流结果");
+            assert_eq!(
+                remuxed.streams.len(),
+                service.inspect(&input).unwrap().streams.len()
+            );
+        }
     }
 
     #[test]
