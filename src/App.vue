@@ -54,6 +54,10 @@ const busyMessage = computed(() => {
   return "正在分析 MKV 文件，请稍候…";
 });
 
+const defaultSubtitleStreamIndex = computed(() =>
+  media.value?.streams.find((stream) => stream.streamType === "subtitle" && stream.defaultStream)?.index ?? null,
+);
+
 const activeTab = computed(() => editorTabs.value.find((tab) => tab.stream.index === activeTabId.value) ?? null);
 const subtitle = computed(() => activeTab.value?.subtitle ?? null);
 const subtitleContent = computed({
@@ -209,13 +213,36 @@ async function loadFile(path) {
   subsetFonts.value = true;
   try {
     media.value = await invoke("inspect_mkv", { path });
-    for (const stream of media.value.streams) stream.selected = true;
+    let foundDefaultSubtitle = false;
+    for (const stream of media.value.streams) {
+      stream.selected = true;
+      if (stream.streamType === "subtitle" && stream.defaultStream) {
+        if (foundDefaultSubtitle) stream.defaultStream = false;
+        foundDefaultSubtitle = true;
+      }
+    }
   } catch (reason) {
     media.value = null;
     showError(reason);
   } finally {
     loading.value = false;
   }
+}
+
+function setDefaultSubtitle(stream, checked) {
+  if (stream.streamType !== "subtitle") return;
+  if (checked) {
+    for (const candidate of media.value?.streams ?? []) {
+      if (candidate.streamType === "subtitle") candidate.defaultStream = candidate.index === stream.index;
+    }
+  } else {
+    stream.defaultStream = false;
+  }
+}
+
+function setStreamSelected(stream, checked) {
+  stream.selected = checked;
+  if (!checked && stream.streamType === "subtitle") stream.defaultStream = false;
 }
 
 async function chooseFile() {
@@ -360,6 +387,7 @@ async function saveSubtitle() {
       outputPath,
       edits,
       selectedStreamIndices,
+      defaultSubtitleStreamIndex: defaultSubtitleStreamIndex.value,
       fontAttachments: fontAttachments.value.map((font) => ({ path: font.path })),
       subsetFonts: subsetFonts.value,
     });
@@ -585,14 +613,33 @@ onBeforeUnmount(() => {
               @keydown.space.prevent="selectStream(stream)"
             >
               <label class="stream-selection" :title="stream.selected ? '导出此流' : '剔除此流'" @click.stop>
-                <input v-model="stream.selected" type="checkbox" :disabled="busy" :aria-label="`${streamLabel(stream)} 导出`" />
+                <input
+                  :checked="stream.selected"
+                  type="checkbox"
+                  :disabled="busy"
+                  :aria-label="`${streamLabel(stream)} 导出`"
+                  @change="setStreamSelected(stream, $event.target.checked)"
+                />
               </label>
               <span class="stream-index">{{ streamLabel(stream) }}</span>
               <strong>{{ stream.codecName ?? "未知编码" }}</strong>
               <small v-if="stream.streamType === 'subtitle'" class="stream-details">
                 <span v-if="stream.title">文件名：{{ stream.title }}</span>
-                <span v-if="stream.language">语言：{{ readableLanguage(stream.language) }}({{stream.language}})</span>
-                <span v-if="!stream.title && !stream.language">{{ stream.codecDescription || "无附加信息" }}</span>
+                <span class="subtitle-language-row">
+                  <span v-if="stream.language">语言：{{ readableLanguage(stream.language) }}({{stream.language}})</span>
+                  <span v-else-if="!stream.title">{{ stream.codecDescription || "无附加信息" }}</span>
+                  <span v-else></span>
+                  <label class="subtitle-default-selection" title="设为默认字幕" @click.stop>
+                    <input
+                      :checked="stream.defaultStream"
+                      type="checkbox"
+                      :disabled="busy"
+                      :aria-label="`${streamLabel(stream)} 默认字幕`"
+                      @change="setDefaultSubtitle(stream, $event.target.checked)"
+                    />
+                    <span>默认字幕</span>
+                  </label>
+                </span>
               </small>
               <small v-else-if="stream.streamType === 'attachment'">
                 {{ stream.filename ? `文件名：${stream.filename}` : (stream.title || stream.codecDescription || "无附加信息") }}
@@ -790,6 +837,12 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .subtitle-tabs { overflow-y: hidden; }
 .subtitle-tabs::after { content: ""; flex: 1 0 0; align-self: flex-end; border-bottom: 1px solid #2b3855; }
 .subtitle-tab { margin-bottom: 0; }
+.subtitle-language-row { display: flex !important; align-items: center; justify-content: space-between; gap: 8px; }
+.subtitle-language-row > :first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stream-row .stream-details { width: 100%; max-width: none; }
+.subtitle-default-selection { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; color: #9eadc9; font-size: .65rem; cursor: pointer; }
+.subtitle-default-selection input { width: 14px; height: 14px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }
+.subtitle-default-selection input:disabled { cursor: wait; }
 .subtitle-language { position: relative; display: flex; align-items: center; gap: 6px; margin-left: 6px; }
 .language-picker-trigger { width: 62px; display: flex; align-items: center; justify-content: space-between; gap: 5px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 6px; color: #e5edff; background: #101827; text-align: left; }
 .language-picker-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -86,13 +86,23 @@ trait FfmpegService: Send + Sync {
         output: &Path,
         edits: &[SubtitleEdit],
     ) -> Result<(), String> {
-        let selected_stream_indices = self
-            .inspect(input)?
-            .streams
+        let streams = self.inspect(input)?.streams;
+        let default_subtitle_stream_index = streams
+            .iter()
+            .find(|stream| stream.stream_type == MediaStreamType::Subtitle && stream.default_stream)
+            .map(|stream| stream.index);
+        let selected_stream_indices = streams
             .into_iter()
             .map(|stream| stream.index)
             .collect::<Vec<_>>();
-        self.remux_selected_streams(input, output, edits, &selected_stream_indices, &[])
+        self.remux_selected_streams(
+            input,
+            output,
+            edits,
+            &selected_stream_indices,
+            default_subtitle_stream_index,
+            &[],
+        )
     }
     fn remux_selected_streams(
         &self,
@@ -100,6 +110,7 @@ trait FfmpegService: Send + Sync {
         output: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        default_subtitle_stream_index: Option<u32>,
         font_attachments: &[FontAttachment],
     ) -> Result<(), String>;
 }
@@ -138,6 +149,7 @@ impl FfmpegService for ActiveFfmpegService {
         output: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        default_subtitle_stream_index: Option<u32>,
         font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         match self {
@@ -146,6 +158,7 @@ impl FfmpegService for ActiveFfmpegService {
                 output,
                 edits,
                 selected_stream_indices,
+                default_subtitle_stream_index,
                 font_attachments,
             ),
             Self::Cli(service) => service.remux_selected_streams(
@@ -153,6 +166,7 @@ impl FfmpegService for ActiveFfmpegService {
                 output,
                 edits,
                 selected_stream_indices,
+                default_subtitle_stream_index,
                 font_attachments,
             ),
         }
@@ -736,6 +750,7 @@ impl FfmpegService for FFIFfmpegService {
         output_path: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        default_subtitle_stream_index: Option<u32>,
         font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         Self::initialize()?;
@@ -768,6 +783,17 @@ impl FfmpegService for FFIFfmpegService {
                     "目前可编辑 SRT、ASS/SSA 和 WebVTT 字幕流；图形字幕会保留但不可编辑。"
                         .to_string(),
                 );
+            }
+        }
+        if let Some(default_stream_index) = default_subtitle_stream_index {
+            let stream = input
+                .streams()
+                .find(|stream| stream.index() == default_stream_index as usize)
+                .ok_or_else(|| "未找到要设为默认的字幕流。".to_string())?;
+            if !selected_streams.contains(&stream.index())
+                || Self::stream_type(stream.parameters().medium()) != MediaStreamType::Subtitle
+            {
+                return Err("默认字幕必须是要导出的字幕流。".to_string());
             }
         }
 
@@ -835,6 +861,15 @@ impl FfmpegService for FFIFfmpegService {
                 metadata.set("title", title);
             }
             output_stream.set_metadata(metadata);
+            if Self::stream_type(stream.parameters().medium()) == MediaStreamType::Subtitle {
+                unsafe {
+                    let output_stream = &mut *output_stream.as_mut_ptr();
+                    output_stream.disposition &= !ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
+                    if default_subtitle_stream_index == Some(stream.index() as u32) {
+                        output_stream.disposition |= ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
+                    }
+                }
+            }
             output_indices.insert(stream.index(), output_stream.index());
         }
         for font in font_attachments {
@@ -1330,6 +1365,7 @@ impl FfmpegService for CliFfmpegService {
         output: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        default_subtitle_stream_index: Option<u32>,
         font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         let probe = self.probe(input)?;
@@ -1339,6 +1375,16 @@ impl FfmpegService for CliFfmpegService {
             .collect::<HashSet<_>>();
         if selected_streams.is_empty() {
             return Err("请至少选择一条要导出的流。".to_string());
+        }
+        if let Some(default_stream_index) = default_subtitle_stream_index {
+            if !selected_streams.contains(&default_stream_index)
+                || !probe.streams.iter().any(|stream| {
+                    stream.index == default_stream_index
+                        && stream.codec_type == MediaStreamType::Subtitle
+                })
+            {
+                return Err("默认字幕必须是要导出的字幕流。".to_string());
+            }
         }
         let mut edited_streams = HashSet::new();
         let mut formats = Vec::with_capacity(edits.len());
@@ -1386,6 +1432,7 @@ impl FfmpegService for CliFfmpegService {
         }
 
         command.args(["-map_metadata", "0"]);
+        let mut subtitle_output_index = 0;
         for (output_index, candidate) in probe
             .streams
             .iter()
@@ -1412,6 +1459,16 @@ impl FfmpegService for CliFfmpegService {
                 command
                     .arg(format!("-metadata:s:{output_index}"))
                     .arg(format!("title={title}"));
+            }
+            if candidate.codec_type == MediaStreamType::Subtitle {
+                command
+                    .arg(format!("-disposition:s:{subtitle_output_index}"))
+                    .arg(if default_subtitle_stream_index == Some(candidate.index) {
+                        "+default"
+                    } else {
+                        "-default"
+                    });
+                subtitle_output_index += 1;
             }
         }
 
@@ -2013,6 +2070,7 @@ mod tests {
                     title: None,
                 }],
                 &selected_stream_indices,
+                Some(stream.index),
                 &[],
             )
             .expect("FFI FFmpeg 应能将 SRT 字幕重混流为 ASS");
@@ -2022,6 +2080,17 @@ mod tests {
             .expect("转换后的 ASS 字幕应可读取");
         assert_eq!(remuxed.format, "ass");
         assert!(remuxed.content.starts_with("[Script Info]"));
+        let default_subtitle_streams = service
+            .inspect(&output)
+            .expect("转换后的文件应可探测")
+            .streams
+            .into_iter()
+            .filter(|stream| {
+                stream.stream_type == MediaStreamType::Subtitle && stream.default_stream
+            })
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        assert_eq!(default_subtitle_streams, vec![stream.index]);
         assert_reads_subtitle_from_downloaded_test_file(&output);
     }
 
@@ -2121,6 +2190,7 @@ async fn save_subtitles(
     output_path: String,
     edits: Vec<SubtitleEdit>,
     selected_stream_indices: Vec<u32>,
+    default_subtitle_stream_index: Option<u32>,
     mut font_attachments: Vec<FontAttachment>,
     subset_fonts: bool,
 ) -> Result<(), String> {
@@ -2145,6 +2215,7 @@ async fn save_subtitles(
             &output,
             &edits,
             &selected_stream_indices,
+            default_subtitle_stream_index,
             &font_attachments,
         )
     })
