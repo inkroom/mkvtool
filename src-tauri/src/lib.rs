@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
 };
 use std::{
@@ -32,6 +33,7 @@ struct MediaStream {
     codec_name: Option<String>,
     codec_description: Option<String>,
     title: Option<String>,
+    filename: Option<String>,
     language: Option<String>,
     default_stream: bool,
     forced: bool,
@@ -67,6 +69,11 @@ struct SubtitleEdit {
     title: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct FontAttachment {
+    path: String,
+}
+
 trait FfmpegService: Send + Sync {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String>;
     fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String>;
@@ -82,7 +89,7 @@ trait FfmpegService: Send + Sync {
             .into_iter()
             .map(|stream| stream.index)
             .collect::<Vec<_>>();
-        self.remux_selected_streams(input, output, edits, &selected_stream_indices)
+        self.remux_selected_streams(input, output, edits, &selected_stream_indices, &[])
     }
     fn remux_selected_streams(
         &self,
@@ -90,6 +97,7 @@ trait FfmpegService: Send + Sync {
         output: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        font_attachments: &[FontAttachment],
     ) -> Result<(), String>;
 }
 
@@ -127,10 +135,23 @@ impl FfmpegService for ActiveFfmpegService {
         output: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         match self {
-            Self::Ffi(service) => service.remux_selected_streams(input, output, edits, selected_stream_indices),
-            Self::Cli(service) => service.remux_selected_streams(input, output, edits, selected_stream_indices),
+            Self::Ffi(service) => service.remux_selected_streams(
+                input,
+                output,
+                edits,
+                selected_stream_indices,
+                font_attachments,
+            ),
+            Self::Cli(service) => service.remux_selected_streams(
+                input,
+                output,
+                edits,
+                selected_stream_indices,
+                font_attachments,
+            ),
         }
     }
 }
@@ -152,6 +173,32 @@ fn canonical_codec_name(codec_name: &str) -> String {
 
 fn normalize_srt_line_endings(content: String) -> String {
     content.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn font_attachment_data(font: &FontAttachment) -> Result<(String, &'static str, Vec<u8>), String> {
+    let path = Path::new(&font.path);
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .ok_or_else(|| "字体文件必须使用 .ttf、.ttc 或 .otf 扩展名。".to_string())?;
+    let mime_type = match extension.as_str() {
+        "ttf" | "ttc" => "application/x-truetype-font",
+        "otf" => "application/vnd.ms-opentype",
+        _ => return Err("字体文件必须使用 .ttf、.ttc 或 .otf 扩展名。".to_string()),
+    };
+    let filename = path
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .filter(|filename| !filename.is_empty())
+        .ok_or_else(|| "无法确定字体文件名。".to_string())?
+        .to_string();
+    let content =
+        fs::read(path).map_err(|error| format!("无法读取字体文件 {filename}：{error}"))?;
+    if content.is_empty() {
+        return Err(format!("字体文件 {filename} 为空。"));
+    }
+    Ok((filename, mime_type, content))
 }
 
 #[derive(Clone)]
@@ -500,6 +547,7 @@ impl FfmpegService for FFIFfmpegService {
                     codec_name,
                     codec_description,
                     title: metadata.get("title").map(str::to_string),
+                    filename: metadata.get("filename").map(str::to_string),
                     language: metadata.get("language").map(str::to_string),
                     default_stream: disposition.contains(Disposition::DEFAULT),
                     forced: disposition.contains(Disposition::FORCED),
@@ -551,6 +599,7 @@ impl FfmpegService for FFIFfmpegService {
         output_path: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         Self::initialize()?;
 
@@ -615,6 +664,40 @@ impl FfmpegService for FFIFfmpegService {
             }
             output_stream.set_metadata(metadata);
             output_indices.insert(stream.index(), output_stream.index());
+        }
+        for font in font_attachments {
+            let (filename, mime_type, content) = font_attachment_data(font)?;
+            let mut parameters = ffmpeg_next::codec::Parameters::new();
+            unsafe {
+                let parameters = &mut *parameters.as_mut_ptr();
+                parameters.codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
+                parameters.codec_id = match mime_type {
+                    "application/vnd.ms-opentype" => ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_OTF,
+                    _ => ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_TTF,
+                };
+                parameters.extradata_size = content.len() as i32;
+                parameters.extradata = ffmpeg_next::ffi::av_mallocz(
+                    content.len() + ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+                ) as *mut u8;
+                if parameters.extradata.is_null() {
+                    return Err("无法为字体附件分配内存。".to_string());
+                }
+                std::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    parameters.extradata,
+                    content.len(),
+                );
+            }
+            let mut output_stream = output
+                .add_stream_with(
+                    &ffmpeg_next::codec::context::Context::from_parameters(parameters)
+                        .map_err(|error| format!("无法创建字体附件流：{error}"))?,
+                )
+                .map_err(|error| format!("无法创建字体附件流：{error}"))?;
+            let mut metadata = ffmpeg_next::Dictionary::new();
+            metadata.set("filename", &filename);
+            metadata.set("mimetype", mime_type);
+            output_stream.set_metadata(metadata);
         }
         output
             .write_header()
@@ -756,6 +839,7 @@ struct ProbeStream {
 #[derive(Debug, Default, serde::Deserialize)]
 struct StreamTags {
     title: Option<String>,
+    filename: Option<String>,
     language: Option<String>,
 }
 #[derive(Debug, Default, serde::Deserialize)]
@@ -842,6 +926,12 @@ impl CliFfmpegService {
                         .get_or_insert_with(Default::default)
                         .title = Some(value.to_string())
                 }
+                "filename" => {
+                    streams[stream_index]
+                        .tags
+                        .get_or_insert_with(Default::default)
+                        .filename = Some(value.to_string())
+                }
                 "language" => {
                     streams[stream_index]
                         .tags
@@ -888,6 +978,7 @@ impl CliFfmpegService {
             codec_long_name: Some(codec_description.to_string()),
             tags: language.map(|language| StreamTags {
                 title: None,
+                filename: None,
                 language: Some(language),
             }),
             disposition: Some(Disposition {
@@ -980,6 +1071,7 @@ impl FfmpegService for CliFfmpegService {
                     codec_name,
                     codec_description: stream.codec_long_name,
                     title: tags.as_ref().and_then(|tags| tags.title.clone()),
+                    filename: tags.as_ref().and_then(|tags| tags.filename.clone()),
                     language: tags.and_then(|tags| tags.language),
                     default_stream: disposition.default.unwrap_or(0) != 0,
                     forced: disposition.forced.unwrap_or(0) != 0,
@@ -1039,9 +1131,13 @@ impl FfmpegService for CliFfmpegService {
         output: &Path,
         edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
+        font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         let probe = self.probe(input)?;
-        let selected_streams = selected_stream_indices.iter().copied().collect::<HashSet<_>>();
+        let selected_streams = selected_stream_indices
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         if selected_streams.is_empty() {
             return Err("请至少选择一条要导出的流。".to_string());
         }
@@ -1057,7 +1153,9 @@ impl FfmpegService for CliFfmpegService {
             formats.push(format);
         }
 
-        let subtitle_server = (!edits.is_empty()).then(|| SubtitleServer::start(edits)).transpose()?;
+        let subtitle_server = (!edits.is_empty())
+            .then(|| SubtitleServer::start(edits))
+            .transpose()?;
 
         let mut command = self.ffmpeg_command();
         command.args(["-v", "error", "-i"]).arg(input);
@@ -1112,6 +1210,31 @@ impl FfmpegService for CliFfmpegService {
                     .arg(format!("-metadata:s:{output_index}"))
                     .arg(format!("title={title}"));
             }
+        }
+
+        let selected_attachment_count = probe
+            .streams
+            .iter()
+            .filter(|stream| {
+                selected_streams.contains(&stream.index)
+                    && stream.codec_type == MediaStreamType::Attachment
+            })
+            .count();
+        for (font_index, font) in font_attachments.iter().enumerate() {
+            let (filename, mime_type, _) = font_attachment_data(font)?;
+            command.arg("-attach").arg(&font.path);
+            command
+                .arg(format!(
+                    "-metadata:s:t:{}",
+                    selected_attachment_count + font_index
+                ))
+                .arg(format!("filename={filename}"));
+            command
+                .arg(format!(
+                    "-metadata:s:t:{}",
+                    selected_attachment_count + font_index
+                ))
+                .arg(format!("mimetype={mime_type}"));
         }
 
         command
@@ -1265,10 +1388,11 @@ mod tests {
                 );
             }
 
-            assert_eq!(cli_media
-                .streams
-                .iter()
-                .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")),
+            assert_eq!(
+                cli_media
+                    .streams
+                    .iter()
+                    .any(|stream| stream.editable && stream.codec_name.as_deref() == Some("ass")),
                 ffi_media
                     .streams
                     .iter()
@@ -1455,6 +1579,7 @@ async fn save_subtitles(
     output_path: String,
     edits: Vec<SubtitleEdit>,
     selected_stream_indices: Vec<u32>,
+    font_attachments: Vec<FontAttachment>,
 ) -> Result<(), String> {
     let input = mkv_path(&input_path)?;
     let output = PathBuf::from(output_path);
@@ -1465,10 +1590,16 @@ async fn save_subtitles(
     }
     let service = ActiveFfmpegService::new();
     tauri::async_runtime::spawn_blocking(move || {
-        service.remux_selected_streams(&input, &output, &edits, &selected_stream_indices)
+        service.remux_selected_streams(
+            &input,
+            &output,
+            &edits,
+            &selected_stream_indices,
+            &font_attachments,
+        )
     })
-        .await
-        .map_err(|error| format!("重新混流时出错：{error}"))?
+    .await
+    .map_err(|error| format!("重新混流时出错：{error}"))?
 }
 
 #[tauri::command]
@@ -1476,6 +1607,16 @@ async fn pick_mkv_file(app: tauri::AppHandle) -> Option<String> {
     app.dialog()
         .file()
         .add_filter("Matroska 视频", &["mkv"])
+        .blocking_pick_file()
+        .and_then(|file| file.into_path().ok())
+        .map(|path| path.display().to_string())
+}
+
+#[tauri::command]
+async fn pick_font_file(app: tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .add_filter("字体文件", &["ttf", "otf", "ttc"])
         .blocking_pick_file()
         .and_then(|file| file.into_path().ok())
         .map(|path| path.display().to_string())
@@ -1503,6 +1644,7 @@ pub fn run() {
             read_subtitle,
             save_subtitles,
             pick_mkv_file,
+            pick_font_file,
             pick_output_file
         ])
         .run(tauri::generate_context!())

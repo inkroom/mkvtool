@@ -16,6 +16,7 @@ const error = ref("");
 const notice = ref("");
 const languageMenuOpen = ref(false);
 const languagePickerElement = ref(null);
+const fontAttachments = ref([]);
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
 const languageNames = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "language" })
@@ -124,6 +125,7 @@ async function loadFile(path) {
   selectedStream.value = null;
   editorTabs.value = [];
   activeTabId.value = null;
+  fontAttachments.value = [];
   try {
     media.value = await invoke("inspect_mkv", { path });
     for (const stream of media.value.streams) stream.selected = true;
@@ -142,6 +144,23 @@ async function chooseFile() {
   } catch (reason) {
     showError(reason);
   }
+}
+
+async function chooseFontAttachment() {
+  try {
+    const path = await invoke("pick_font_file");
+    if (!path || fontAttachments.value.some((font) => font.path === path)) return;
+    fontAttachments.value.push({
+      path,
+      name: path.split(/[\\/]/).pop() || path,
+    });
+  } catch (reason) {
+    showError(reason);
+  }
+}
+
+function removeFontAttachment(path) {
+  fontAttachments.value = fontAttachments.value.filter((font) => font.path !== path);
 }
 
 async function minimizeWindow() {
@@ -254,6 +273,7 @@ async function saveSubtitle() {
       outputPath,
       edits,
       selectedStreamIndices,
+      fontAttachments: fontAttachments.value.map((font) => ({ path: font.path })),
     });
     for (const tab of editorTabs.value) {
       if (tab.dirty && tab.stream.selected) {
@@ -461,7 +481,7 @@ onBeforeUnmount(() => {
         </div>
 
         <template v-for="(streams, type) in streamGroups" :key="type">
-          <div v-if="streams.length" class="stream-group">
+          <div v-if="streams.length || type === 'attachment'" class="stream-group">
             <h2>{{ { video: "视频", audio: "音频", subtitle: "字幕", attachment: "附件", other: "其他" }[type] }}</h2>
             <div
               v-for="stream in streams"
@@ -484,11 +504,21 @@ onBeforeUnmount(() => {
                 <span v-if="stream.language">语言：{{ readableLanguage(stream.language) }}({{stream.language}})</span>
                 <span v-if="!stream.title && !stream.language">{{ stream.codecDescription || "无附加信息" }}</span>
               </small>
+              <small v-else-if="stream.streamType === 'attachment'">
+                {{ stream.filename ? `文件名：${stream.filename}` : (stream.title || stream.codecDescription || "无附加信息") }}
+              </small>
               <small v-else>{{ stream.title || readableLanguage(stream.language) || stream.codecDescription || "无附加信息" }}</small>
               <span v-if="stream.editable || stream.defaultStream || stream.forced" class="stream-tags">
                 <span v-if="stream.editable" class="editable">可编辑</span>
                 <span v-if="stream.defaultStream || stream.forced" class="flags">{{ stream.defaultStream ? "默认" : "" }} {{ stream.forced ? "强制" : "" }}</span>
               </span>
+            </div>
+            <div v-if="type === 'attachment'" class="font-attachments">
+              <button class="add-font-attachment" type="button" :disabled="busy" @click="chooseFontAttachment">选择字体文件</button>
+              <div v-for="font in fontAttachments" :key="font.path" class="font-attachment">
+                <span :title="font.path">{{ font.name }}</span>
+                <button type="button" :disabled="busy" :aria-label="`移除 ${font.name}`" title="移除字体" @click="removeFontAttachment(font.path)">×</button>
+              </div>
             </div>
           </div>
         </template>
@@ -623,6 +653,7 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
 .sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-logo { width: 34px; height: 34px; flex: 0 0 34px; object-fit: contain; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }
 .stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px 10px 34px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; cursor: pointer; }.stream-row:hover { background: #1a2740; }.stream-row:focus-visible { outline: 2px solid #7fe2b7; outline-offset: -2px; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-selection { position: absolute; top: 12px; left: 10px; display: grid; place-items: center; cursor: pointer; }.stream-selection input { width: 15px; height: 15px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }.stream-selection input:disabled { cursor: wait; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
+.font-attachments { display: grid; gap: 5px; margin: 5px 0 4px; padding: 0 8px; }.add-font-attachment { width: 100%; border: 1px dashed #536987; border-radius: 5px; padding: 6px 8px; color: #bcd0ee; background: #17243b; font-size: .73rem; text-align: left; }.add-font-attachment:hover { border-color: #7fe2b7; color: #e5fff3; background: #1b3245; }.font-attachment { min-width: 0; display: flex; align-items: center; gap: 5px; padding: 4px 5px 4px 7px; border: 1px solid #354969; border-radius: 5px; color: #aebcd5; background: #151f32; font-size: .7rem; }.font-attachment span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.font-attachment button { width: 19px; height: 19px; flex: 0 0 19px; padding: 0; border: 0; border-radius: 3px; color: #b8c7e1; background: transparent; font-size: 1rem; line-height: 1; }.font-attachment button:hover { color: #fff; background: #6a3441; }
 .editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-heading { min-width: 0; flex: 1; }.editor-header h2 { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-actions { display: flex; flex: 0 1 auto; align-items: flex-end; gap: 10px; }.subtitle-title-field { min-width: 0; display: grid; gap: 3px; color: #a9b6cf; font-size: .72rem; }.subtitle-title-field input { width: min(240px, 28vw); min-width: 120px; padding: 5px 7px; border: 1px solid #425a87; border-radius: 5px; color: #e5edff; background: #101827; }.subtitle-title-field input:focus { outline: 2px solid #7fe2b7; outline-offset: 1px; }.editor-header .primary { flex: 0 0 auto; padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { min-width: 0; align-items: flex-end; padding-top: 6px; padding-bottom: 0; border-bottom: 1px solid #2b3855; }.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 9px; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }.subtitle-tabs { align-self: stretch; min-width: 0; display: flex; flex: 1; align-items: flex-end; gap: 0; overflow-x: auto; scrollbar-width: none; }.subtitle-tabs::-webkit-scrollbar { display: none; }.subtitle-tab { position: relative; z-index: 0; flex: 0 0 auto; max-width: 132px; margin: 0 0 -1px -1px; overflow: hidden; border: 1px solid #33486e; border-bottom-color: #2b3855; border-radius: 5px 5px 0 0; padding: 7px 9px 8px; color: #9eafcf; background: #18243a; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }.subtitle-tab:first-child { margin-left: 0; }.subtitle-tab:hover { z-index: 1; border-color: #536987; color: #dbe7ff; background: #223451; }.subtitle-tab.active { z-index: 2; border-color: #6d92d6; border-bottom: 0; padding-bottom: 9px; color: #edf3ff; background: #101827; }.subtitle-tab.dirty { color: #d8f1a6; }.subtitle-tab span { margin-left: 3px; color: #7fe2b7; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }
 .timestamp-start-row { border-bottom: 0; }
 .timestamp-start-row { position: relative; gap: 8px; }
