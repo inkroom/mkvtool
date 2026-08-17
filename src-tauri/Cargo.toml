@@ -29,6 +29,7 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format"] }
+allsorts = { git = "https://github.com/yeslogic/allsorts", rev = "e69b42ebe46ec5d78e10b7ded3973cf1e43681a9" }
 
 [dev-dependencies]
 ureq = "2.12"

@@ -72,6 +72,8 @@ struct SubtitleEdit {
 #[derive(Debug, serde::Deserialize)]
 struct FontAttachment {
     path: String,
+    #[serde(skip)]
+    content: Option<Vec<u8>>,
 }
 
 trait FfmpegService: Send + Sync {
@@ -193,12 +195,55 @@ fn font_attachment_data(font: &FontAttachment) -> Result<(String, &'static str, 
         .filter(|filename| !filename.is_empty())
         .ok_or_else(|| "无法确定字体文件名。".to_string())?
         .to_string();
-    let content =
-        fs::read(path).map_err(|error| format!("无法读取字体文件 {filename}：{error}"))?;
+    let content = match &font.content {
+        Some(content) => content.clone(),
+        None => fs::read(path).map_err(|error| format!("无法读取字体文件 {filename}：{error}"))?,
+    };
     if content.is_empty() {
         return Err(format!("字体文件 {filename} 为空。"));
     }
     Ok((filename, mime_type, content))
+}
+
+fn subtitle_text_for_font_subset(
+    service: &impl FfmpegService,
+    input: &Path,
+    edits: &[SubtitleEdit],
+) -> Result<String, String> {
+    let media = service.inspect(input)?;
+    let mut text = String::new();
+    for stream in media.streams.iter().filter(|stream| stream.editable) {
+        if let Some(edit) = edits.iter().find(|edit| edit.stream_index == stream.index) {
+            text.push_str(&edit.content);
+        } else if let Some(subtitle) = &stream.subtitle {
+            text.push_str(&subtitle.content);
+        } else {
+            text.push_str(&service.read_subtitle(input, stream.index)?.content);
+        }
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+fn prepare_font_attachments(
+    service: &impl FfmpegService,
+    input: &Path,
+    edits: &[SubtitleEdit],
+    font_attachments: &mut [FontAttachment],
+    subset_fonts: bool,
+) -> Result<(), String> {
+    if !subset_fonts || font_attachments.is_empty() {
+        return Ok(());
+    }
+
+    let text = subtitle_text_for_font_subset(service, input, edits)?;
+    for font in font_attachments {
+        font.content = Some(
+            font::subset_text_from_path(&font.path, &text)
+                .ok_or_else(|| format!("无法子集化字体文件 {}。", font.path))?,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1220,9 +1265,24 @@ impl FfmpegService for CliFfmpegService {
                     && stream.codec_type == MediaStreamType::Attachment
             })
             .count();
+        let mut temporary_font_files = Vec::new();
         for (font_index, font) in font_attachments.iter().enumerate() {
             let (filename, mime_type, _) = font_attachment_data(font)?;
-            command.arg("-attach").arg(&font.path);
+            let attachment_path = if let Some(content) = &font.content {
+                let temporary_path = std::env::temp_dir().join(format!(
+                    "mkvtool-font-{}-{}-{}",
+                    std::process::id(),
+                    font_index,
+                    filename
+                ));
+                fs::write(&temporary_path, content)
+                    .map_err(|error| format!("无法写入临时字体文件：{error}"))?;
+                temporary_font_files.push(temporary_path.clone());
+                temporary_path
+            } else {
+                PathBuf::from(&font.path)
+            };
+            command.arg("-attach").arg(attachment_path);
             command
                 .arg(format!(
                     "-metadata:s:t:{}",
@@ -1244,8 +1304,11 @@ impl FfmpegService for CliFfmpegService {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let output_result = command
-            .output()
+        let output_result = command.output();
+        for temporary_path in temporary_font_files {
+            let _ = fs::remove_file(temporary_path);
+        }
+        let output_result = output_result
             .map_err(|error| format!("无法启动 ffmpeg，请确认已安装 FFmpeg：{error}"))?;
 
         if !output_result.status.success() {
@@ -1255,6 +1318,157 @@ impl FfmpegService for CliFfmpegService {
     }
 }
 
+mod font {
+    use std::convert::TryFrom;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::str;
+
+    use allsorts::gsub::{GlyphOrigin, RawGlyph, RawGlyphFlags};
+    use allsorts::subset::SubsetProfile;
+
+    use allsorts::binary::read::{ReadScope, ReadScopeOwned};
+    use allsorts::error::ParseError;
+    use allsorts::font_data::FontData;
+    use allsorts::tables::{FontTableProvider, NameTable, OffsetTable, OpenTypeData, TTCHeader};
+    use allsorts::tag::{self};
+    use allsorts::woff::WoffFont;
+    use allsorts::woff2::Woff2Font;
+
+    pub type BoxError = Box<dyn std::error::Error>;
+    ///
+    /// 字体子集化
+    ///
+    pub(crate) fn subset_text_from_path(input: &str, text: &str) -> Option<Vec<u8>> {
+        let data = std::fs::read(input).ok()?;
+        let font_file = ReadScope::new(&data).read::<FontData>().ok()?;
+        let provider = font_file.table_provider(0).ok()?;
+        subset_text(&provider, text)
+    }
+
+    ///
+    /// 字体子集化
+    ///
+    pub(crate) fn subset_text<F: FontTableProvider>(
+        font_provider: &F,
+        text: &str,
+    ) -> Option<Vec<u8>> {
+        let text = format!("{text}?◻"); // 添加两个占位符，用于字符不存在时渲染，避免完全不渲染的空白
+
+        match do_subset_text(font_provider, remove_duplicate_chars(&text).as_str()) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("subset fail: {e:?}");
+                None
+            }
+        }
+    }
+    /// 文本去重
+    fn remove_duplicate_chars(input: &str) -> String {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = String::new();
+
+        for c in input.chars() {
+            if !seen.contains(&c) {
+                seen.insert(c);
+                result.push(c);
+            }
+        }
+
+        result
+    }
+
+    /// 随机数算法
+    fn lcg(seed: u32) -> u32 {
+        let a: u64 = 1664525;
+        let c: u64 = 1013904223;
+        let m: u64 = 1 << 32;
+        ((a * seed as u64 + c) % m) as u32
+    }
+
+    fn do_subset_text<F: FontTableProvider>(
+        font_provider: &F,
+        text: &str,
+    ) -> Result<Vec<u8>, BoxError> {
+        // Work out the glyphs we want to keep from the text
+        let mut glyphs = chars_to_glyphs(font_provider, text)?;
+        let notdef = RawGlyph {
+            unicodes: allsorts::tinyvec::tiny_vec![],
+            glyph_index: 0,
+            liga_component_pos: 0,
+            glyph_origin: GlyphOrigin::Direct,
+            flags: RawGlyphFlags::empty(),
+            variation: None,
+            extra_data: (),
+        };
+        glyphs.insert(0, Some(notdef));
+
+        let mut glyphs: Vec<RawGlyph<()>> = glyphs.into_iter().flatten().collect();
+        glyphs.sort_by(|a, b| a.glyph_index.cmp(&b.glyph_index));
+        let mut glyph_ids = glyphs
+            .iter()
+            .map(|glyph| glyph.glyph_index)
+            .collect::<Vec<_>>();
+        glyph_ids.dedup();
+        if glyph_ids.is_empty() {
+            panic!("no glyphs left in font");
+        }
+
+        // Subset
+        let mut new_font = allsorts::subset::subset(
+            font_provider,
+            &glyph_ids,
+            &SubsetProfile::Minimal,
+            allsorts::subset::CmapTarget::Unrestricted,
+        )?;
+
+        Ok(new_font)
+    }
+
+    fn chars_to_glyphs<F: FontTableProvider>(
+        font_provider: &F,
+        text: &str,
+    ) -> Result<Vec<Option<RawGlyph<()>>>, BoxError> {
+        let cmap_data = font_provider.read_table_data(allsorts::tag::CMAP)?;
+        let cmap = allsorts::binary::read::ReadScope::new(&cmap_data)
+            .read::<allsorts::tables::cmap::Cmap>()?;
+        let (_, cmap_subtable) = allsorts::font::read_cmap_subtable(&cmap)?.ok_or("fail")?;
+
+        let glyphs = text
+            .chars()
+            .map(|ch| map(&cmap_subtable, ch, None))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(glyphs)
+    }
+    fn map(
+        cmap_subtable: &allsorts::tables::cmap::CmapSubtable,
+        ch: char,
+        variation: Option<allsorts::unicode::VariationSelector>,
+    ) -> Result<Option<RawGlyph<()>>, allsorts::error::ParseError> {
+        if let Some(glyph_index) = cmap_subtable.map_glyph(ch as u32)? {
+            let glyph = make(ch, glyph_index, variation);
+            Ok(Some(glyph))
+        } else {
+            Ok(None)
+        }
+    }
+    fn make(
+        ch: char,
+        glyph_index: u16,
+        variation: Option<allsorts::unicode::VariationSelector>,
+    ) -> RawGlyph<()> {
+        RawGlyph {
+            unicodes: allsorts::tinyvec::tiny_vec![[char; 1] => ch],
+            glyph_index,
+            liga_component_pos: 0,
+            glyph_origin: GlyphOrigin::Char(ch),
+            flags: RawGlyphFlags::empty(),
+            variation,
+            extra_data: (),
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1579,7 +1793,8 @@ async fn save_subtitles(
     output_path: String,
     edits: Vec<SubtitleEdit>,
     selected_stream_indices: Vec<u32>,
-    font_attachments: Vec<FontAttachment>,
+    mut font_attachments: Vec<FontAttachment>,
+    subset_fonts: bool,
 ) -> Result<(), String> {
     let input = mkv_path(&input_path)?;
     let output = PathBuf::from(output_path);
@@ -1590,6 +1805,13 @@ async fn save_subtitles(
     }
     let service = ActiveFfmpegService::new();
     tauri::async_runtime::spawn_blocking(move || {
+        prepare_font_attachments(
+            &service,
+            &input,
+            &edits,
+            &mut font_attachments,
+            subset_fonts,
+        )?;
         service.remux_selected_streams(
             &input,
             &output,
