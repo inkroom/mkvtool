@@ -56,7 +56,7 @@ RUN REPO=sjtug/ohmyzsh REMOTE=https://git.sjtu.edu.cn/${REPO}.git sh -c "$(curl 
   && echo "setopt no_nomatch" >> /root/.zshrc \
   && echo "setopt histignorespace" >> /root/.zshrc \
   && echo "export LESSCHARSET=utf-8" >> /root/.zshrc \
-
+  && git config --global core.quotepath false
 
 
 RUN echo "export CARGO_HOME=${CARGO_HOME}" >> /etc/profile \

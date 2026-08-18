@@ -89,30 +89,6 @@ trait FfmpegService: Send + Sync {
         input: &Path,
         output: &Path,
         edits: &[SubtitleEdit],
-    ) -> Result<(), String> {
-        let streams = self.inspect(input)?.streams;
-        let default_subtitle_stream_index = streams
-            .iter()
-            .find(|stream| stream.stream_type == MediaStreamType::Subtitle && stream.default_stream)
-            .map(|stream| stream.index);
-        let selected_stream_indices = streams
-            .into_iter()
-            .map(|stream| stream.index)
-            .collect::<Vec<_>>();
-        self.remux_selected_streams(
-            input,
-            output,
-            edits,
-            &selected_stream_indices,
-            default_subtitle_stream_index,
-            &[],
-        )
-    }
-    fn remux_selected_streams(
-        &self,
-        input: &Path,
-        output: &Path,
-        edits: &[SubtitleEdit],
         selected_stream_indices: &[u32],
         default_subtitle_stream_index: Option<u32>,
         font_attachments: &[FontAttachment],
@@ -147,7 +123,7 @@ impl FfmpegService for ActiveFfmpegService {
         }
     }
 
-    fn remux_selected_streams(
+    fn remux_subtitles(
         &self,
         input: &Path,
         output: &Path,
@@ -157,7 +133,7 @@ impl FfmpegService for ActiveFfmpegService {
         font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         match self {
-            Self::Ffi(service) => service.remux_selected_streams(
+            Self::Ffi(service) => service.remux_subtitles(
                 input,
                 output,
                 edits,
@@ -165,7 +141,7 @@ impl FfmpegService for ActiveFfmpegService {
                 default_subtitle_stream_index,
                 font_attachments,
             ),
-            Self::Cli(service) => service.remux_selected_streams(
+            Self::Cli(service) => service.remux_subtitles(
                 input,
                 output,
                 edits,
@@ -929,14 +905,14 @@ impl FfmpegService for FFIFfmpegService {
 
         let mut input = ffmpeg_next::format::input(path)
             .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-        return Self::read_subtitles(&mut input, &[stream_index]).and_then(|mut subtitles| {
+        Self::read_subtitles(&mut input, &[stream_index]).and_then(|mut subtitles| {
             subtitles
                 .remove(&stream_index)
                 .ok_or_else(|| "未找到所选字幕流。".to_string())
-        });
+        })
     }
 
-    fn remux_selected_streams(
+    fn remux_subtitles(
         &self,
         input_path: &Path,
         output_path: &Path,
@@ -1013,7 +989,9 @@ impl FfmpegService for FFIFfmpegService {
             }
             if stream.parameters().medium() == ffmpeg_next::media::Type::Subtitle {
                 if let Some(edit) = new_subtitle.as_ref() {
-                    if !output_indices.contains_key(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        output_indices.entry(NEW_SUBTITLE_STREAM_INDEX as usize)
+                    {
                         if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
                             return Err("新建字幕必须被选择导出。".to_string());
                         }
@@ -1022,7 +1000,7 @@ impl FfmpegService for FFIFfmpegService {
                             edit,
                             default_subtitle_stream_index,
                         )?;
-                        output_indices.insert(NEW_SUBTITLE_STREAM_INDEX as usize, index);
+                        e.insert(index);
                     }
                 }
             }
@@ -1094,7 +1072,9 @@ impl FfmpegService for FFIFfmpegService {
             output_indices.insert(stream.index(), output_stream.index());
         }
         if let Some(edit) = new_subtitle.as_ref() {
-            if !output_indices.contains_key(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                output_indices.entry(NEW_SUBTITLE_STREAM_INDEX as usize)
+            {
                 if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
                     return Err("新建字幕必须被选择导出。".to_string());
                 }
@@ -1103,7 +1083,7 @@ impl FfmpegService for FFIFfmpegService {
                     edit,
                     default_subtitle_stream_index,
                 )?;
-                output_indices.insert(NEW_SUBTITLE_STREAM_INDEX as usize, index);
+                e.insert(index);
             }
         }
         for font in font_attachments {
@@ -1370,7 +1350,7 @@ impl CliFfmpegService {
             .find(|path| path.is_file())
             .map(|executable| Self { executable })
     }
-    
+
     #[cfg(test)]
     fn new() -> Self {
         Self::detect().unwrap_or_else(|| Self {
@@ -1500,17 +1480,20 @@ impl CliFfmpegService {
         })
     }
 
+    #[cfg(target_os = "windows")]
     fn ffmpeg_command(&self) -> Command {
         let mut cmd = Command::new(&self.executable);
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            // 0x08000000 是 CREATE_NO_WINDOW 的标志值
-            cmd.creation_flags(0x08000000);
-        }
+        use std::os::windows::process::CommandExt;
+        // 0x08000000 是 CREATE_NO_WINDOW 的标志值
+        cmd.creation_flags(0x08000000);
         cmd
     }
+    
+    #[cfg(not(target_os = "windows"))]
+    fn ffmpeg_command(&self) -> Command {
+        Command::new(&self.executable)
+    }
+
     fn command_error(&self, command: &str, stderr: &[u8]) -> String {
         let detail = String::from_utf8_lossy(stderr).trim().to_string();
         if detail.is_empty() {
@@ -1639,7 +1622,7 @@ impl FfmpegService for CliFfmpegService {
         })
     }
 
-    fn remux_selected_streams(
+    fn remux_subtitles(
         &self,
         input: &Path,
         output: &Path,
@@ -1887,8 +1870,7 @@ impl FfmpegService for CliFfmpegService {
 
 mod font {
     use std::convert::TryFrom;
-    use std::io::Write;
-    use std::path::PathBuf;
+
     use std::str;
 
     use allsorts::gsub::{GlyphOrigin, RawGlyph, RawGlyphFlags};
@@ -1945,14 +1927,6 @@ mod font {
         result
     }
 
-    /// 随机数算法
-    fn lcg(seed: u32) -> u32 {
-        let a: u64 = 1664525;
-        let c: u64 = 1013904223;
-        let m: u64 = 1 << 32;
-        ((a * seed as u64 + c) % m) as u32
-    }
-
     fn do_subset_text<F: FontTableProvider>(
         font_provider: &F,
         text: &str,
@@ -1971,7 +1945,7 @@ mod font {
         glyphs.insert(0, Some(notdef));
 
         let mut glyphs: Vec<RawGlyph<()>> = glyphs.into_iter().flatten().collect();
-        glyphs.sort_by(|a, b| a.glyph_index.cmp(&b.glyph_index));
+        glyphs.sort_by_key(|a| a.glyph_index);
         let mut glyph_ids = glyphs
             .iter()
             .map(|glyph| glyph.glyph_index)
@@ -1982,7 +1956,7 @@ mod font {
         }
 
         // Subset
-        let mut new_font = allsorts::subset::subset(
+        let new_font = allsorts::subset::subset(
             font_provider,
             &glyph_ids,
             &SubsetProfile::Minimal,
@@ -2207,16 +2181,6 @@ mod tests {
         Ok(fixture)
     }
 
-    fn first_editable_subtitle(service: &ActiveFfmpegService, input: &Path) -> Result<u32, String> {
-        service
-            .inspect(input)?
-            .streams
-            .iter()
-            .find(|stream| stream.editable)
-            .map(|stream| stream.index)
-            .ok_or_else(|| "测试文件中没有可编辑字幕流。".to_string())
-    }
-
     #[test]
     fn assert_inspects_downloaded_test_file() {
         let _lock = ffmpeg_test_lock();
@@ -2349,46 +2313,6 @@ mod tests {
     }
 
     #[test]
-    fn assert_remuxes_subtitle_from_downloaded_test_file() {
-        let _lock = ffmpeg_test_lock();
-        let res = vec!["test.mkv", "test2.mkv"];
-        for m in res {
-            let input = download_test_mkv(m).expect("测试文件应下载到 target 目录");
-            let service = ActiveFfmpegService::new();
-            let stream_index =
-                first_editable_subtitle(&service, &input).expect("测试文件应包含可编辑字幕流");
-            let subtitle = service
-                .read_subtitle(&input, stream_index)
-                .expect("FFmpeg 应能读取测试字幕");
-            let output = test_target_dir()
-                .expect("应能定位 Cargo target 目录")
-                .join("ffmpeg-test-fixtures")
-                .join("remuxed-test.mkv");
-
-            service
-                .remux_subtitles(
-                    &input,
-                    &output,
-                    &[SubtitleEdit {
-                        stream_index,
-                        content: subtitle.content,
-                        format: None,
-                        language: None,
-                        title: None,
-                        new_stream: false,
-                    }],
-                )
-                .expect("FFmpeg 应能重新混流测试字幕");
-
-            let remuxed = service.inspect(&output).expect("FFmpeg 应能探测重混流结果");
-            assert_eq!(
-                remuxed.streams.len(),
-                service.inspect(&input).unwrap().streams.len()
-            );
-        }
-    }
-
-    #[test]
     fn remuxes_new_srt_subtitle_and_reads_same_text() {
         let _lock = ffmpeg_test_lock();
         let input = download_test_mkv("test2.mkv").expect("测试文件应下载到 target 目录");
@@ -2409,7 +2333,7 @@ mod tests {
         selected_stream_indices.push(NEW_SUBTITLE_STREAM_INDEX);
 
         service
-            .remux_selected_streams(
+            .remux_subtitles(
                 &input,
                 &output,
                 &[SubtitleEdit {
@@ -2476,7 +2400,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         service
-            .remux_selected_streams(
+            .remux_subtitles(
                 &input,
                 &output,
                 &[SubtitleEdit {
@@ -2653,7 +2577,7 @@ async fn save_subtitles(
             subset_fonts,
             subtitle_text,
         )?;
-        service.remux_selected_streams(
+        service.remux_subtitles(
             &input,
             &output,
             &edits,
