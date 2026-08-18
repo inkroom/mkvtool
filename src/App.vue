@@ -24,6 +24,7 @@ const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
 const languageNames = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "language" })
   : null;
+const NEW_SUBTITLE_STREAM_INDEX = 0xffffffff;
 
 let unlistenDrop;
 let subtitleTabsElement;
@@ -245,6 +246,45 @@ function setStreamSelected(stream, checked) {
   if (!checked && stream.streamType === "subtitle") stream.defaultStream = false;
 }
 
+function createSubtitle() {
+  if (!media.value || media.value.streams.some((stream) => stream.newStream)) return;
+  const stream = {
+    index: NEW_SUBTITLE_STREAM_INDEX,
+    streamType: "subtitle",
+    codecName: "srt",
+    codecDescription: "SubRip subtitle",
+    title: "",
+    filename: null,
+    language: "chi",
+    defaultStream: false,
+    forced: false,
+    editable: true,
+    selected: true,
+    newStream: true,
+    subtitle: { content: "", format: "srt", codecName: "srt" },
+  };
+  const firstSubtitle = media.value.streams.findIndex((candidate) => candidate.streamType === "subtitle");
+  media.value.streams.splice(firstSubtitle < 0 ? media.value.streams.length : firstSubtitle, 0, stream);
+  const tab = {
+    stream,
+    subtitle: stream.subtitle,
+    originalContent: "",
+    content: "",
+    originalFormat: "srt",
+    format: "srt",
+    originalLanguage: "",
+    language: "chi",
+    originalTitle: "",
+    title: "",
+    newStream: true,
+    dirty: true,
+  };
+  editorTabs.value.unshift(tab);
+  selectedStream.value = stream;
+  activeTabId.value = stream.index;
+  error.value = "";
+}
+
 async function chooseFile() {
   try {
    const path = await invoke("pick_mkv_file");
@@ -311,6 +351,7 @@ async function selectStream(stream) {
       language: stream.language ?? "",
       originalTitle: stream.title ?? "",
       title: stream.title ?? "",
+      newStream: false,
       dirty: false,
     };
     const replaceIndex = editorTabs.value.findIndex((candidate) => !candidate.dirty);
@@ -367,15 +408,36 @@ async function saveSubtitle() {
     showError("请至少选择一条要导出的流。");
     return;
   }
+  for (const tab of editorTabs.value.filter((tab) => tab.newStream && tab.stream.selected)) {
+    if (!tab.content.trim()) {
+      showError("请填写新字幕文本。");
+      return;
+    }
+    if (!tab.title.trim()) {
+      showError("请填写新字幕标题。");
+      return;
+    }
+    if (!tab.language) {
+      showError("请选择新字幕语言。");
+      return;
+    }
+  }
   const edits = editorTabs.value
     .filter((tab) => tab.dirty && tab.stream.selected)
     .map((tab) => ({
       streamIndex: tab.stream.index,
       content: tab.content,
+      ...(tab.newStream ? { newStream: true, format: tab.format, language: tab.language, title: tab.title } : {}),
       ...(tab.language !== tab.originalLanguage ? { language: tab.language } : {}),
       ...(tab.title !== tab.originalTitle ? { title: tab.title } : {}),
       ...(tab.format !== tab.originalFormat ? { format: tab.format } : {}),
     }));
+  const editableSubtitleStreams = media.value.streams.filter((stream) => stream.editable);
+  const subtitleText = editableSubtitleStreams.every((stream) => stream.subtitle)
+    ? editableSubtitleStreams.map((stream) =>
+      editorTabs.value.find((tab) => tab.stream.index === stream.index)?.content ?? stream.subtitle.content,
+    ).join("\n")
+    : null;
   try {
     const defaultName = media.value.name.replace(/\.mkv$/i, "") + "-edited.mkv";
     const outputPath = await invoke("pick_output_file", { suggestedName: defaultName });
@@ -390,6 +452,7 @@ async function saveSubtitle() {
       defaultSubtitleStreamIndex: defaultSubtitleStreamIndex.value,
       fontAttachments: fontAttachments.value.map((font) => ({ path: font.path })),
       subsetFonts: subsetFonts.value,
+      subtitleText,
     });
     for (const tab of editorTabs.value) {
       if (tab.dirty && tab.stream.selected) {
@@ -412,7 +475,7 @@ async function saveSubtitle() {
 
 function streamLabel(stream) {
   const type = { video: "视频", audio: "音频", subtitle: "字幕", attachment: "附件" }[stream.streamType] ?? "其他";
-  return `${type} #${stream.index}`;
+  return stream.newStream ? "新建字幕" : `${type} #${stream.index}`;
 }
 
 function readableLanguage(language) {
@@ -599,8 +662,17 @@ onBeforeUnmount(() => {
         </div>
 
         <template v-for="(streams, type) in streamGroups" :key="type">
-          <div v-if="streams.length || type === 'attachment'" class="stream-group">
-            <h2>{{ { video: "视频", audio: "音频", subtitle: "字幕", attachment: "附件", other: "其他" }[type] }}</h2>
+          <div v-if="streams.length || type === 'attachment' || type === 'subtitle'" class="stream-group">
+            <div class="stream-group-heading">
+              <h2>{{ { video: "视频", audio: "音频", subtitle: "字幕", attachment: "附件", other: "其他" }[type] }}</h2>
+              <button
+                v-if="type === 'subtitle'"
+                class="new-subtitle-button"
+                type="button"
+                :disabled="busy || streams.some((stream) => stream.newStream)"
+                @click="createSubtitle"
+              >新建字幕</button>
+            </div>
             <div
               v-for="stream in streams"
               :key="stream.index"
@@ -825,7 +897,7 @@ h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .message { margin: 0; padding: 10px 13px; border-radius: 0; white-space: pre-wrap; }.error { color: #ffc6c6; background: #4b202b; }.notice { position: fixed; z-index: 9; top: 46px; right: 18px; display: flex; align-items: center; gap: 12px; max-width: min(440px, calc(100vw - 36px)); padding: 10px 10px 10px 14px; border: 1px solid #368568; border-radius: 8px; color: #b7f6d7; background: #173d35; box-shadow: 0 12px 32px #0006; }.notice-close { width: 24px; height: 24px; flex: 0 0 24px; padding: 0; border: 0; border-radius: 5px; color: #d5ffe8; background: transparent; font-size: 1.2rem; line-height: 1; }.notice-close:hover { background: #28604f; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }
 .sidebar { min-height: 0; overflow: auto; padding: 16px 12px; border-right: 1px solid #2b3855; background: #101827; }.file-summary { justify-content: flex-start; padding: 8px 8px 20px; }.file-logo { width: 34px; height: 34px; flex: 0 0 34px; object-fit: contain; }.file-summary strong, .file-summary small { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.file-summary small { color: #8e9bb7; }.file-details { display: flex; align-items: center; gap: 8px; margin-top: 4px; }.choose-file { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #425a87; border-radius: 5px; color: #dbe7ff; background: #1d2c48; font-size: .7rem; }.choose-file:hover { border-color: #7fe2b7; color: #dfffee; }
-.stream-group h2 { margin: 17px 8px 7px; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px 10px 34px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; cursor: pointer; }.stream-row:hover { background: #1a2740; }.stream-row:focus-visible { outline: 2px solid #7fe2b7; outline-offset: -2px; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-selection { position: absolute; top: 12px; left: 10px; display: grid; place-items: center; cursor: pointer; }.stream-selection input { width: 15px; height: 15px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }.stream-selection input:disabled { cursor: wait; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
+.stream-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 17px 8px 7px; }.stream-group-heading h2 { margin: 0; color: #91a1c2; font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }.new-subtitle-button { border: 1px solid #465e8c; border-radius: 5px; padding: 4px 8px; color: #dbe8ff; background: #1c2b47; font-size: .72rem; white-space: nowrap; }.new-subtitle-button:hover:not(:disabled) { border-color: #7fe2b7; color: #effff7; background: #23445a; }.new-subtitle-button:disabled { opacity: .5; cursor: not-allowed; }.stream-row { position: relative; width: 100%; display: block; padding: 10px 9px 10px 34px; text-align: left; border: 1px solid transparent; border-radius: 8px; color: #e8ecf6; background: transparent; cursor: pointer; }.stream-row:hover { background: #1a2740; }.stream-row:focus-visible { outline: 2px solid #7fe2b7; outline-offset: -2px; }.stream-row.selected { border-color: #4e75bc; background: #21365b; }.stream-selection { position: absolute; top: 12px; left: 10px; display: grid; place-items: center; cursor: pointer; }.stream-selection input { width: 15px; height: 15px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }.stream-selection input:disabled { cursor: wait; }.stream-row strong, .stream-row small, .stream-index { display: block; }.stream-index { color: #91a1c2; font-size: .7rem; }.stream-row strong { margin: 2px 0; font-size: .87rem; }.stream-row small { max-width: 220px; overflow: hidden; color: #9eadc9; font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }.stream-row .stream-details { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.35; }.stream-details span { display: block; overflow-wrap: anywhere; }.stream-tags { position: absolute; top: 9px; right: 8px; display: flex; gap: 4px; }.editable, .flags { border-radius: 4px; padding: 2px 4px; font-size: .62rem; white-space: nowrap; }.editable { color: #13261f; background: #7fe2b7; }.flags { color: #bfcae1; background: #31425f; }
 .font-attachments { display: grid; gap: 5px; margin: 5px 0 4px; padding: 0 8px; }.add-font-attachment { width: 100%; border: 1px dashed #536987; border-radius: 5px; padding: 6px 8px; color: #bcd0ee; background: #17243b; font-size: .73rem; text-align: left; }.add-font-attachment:hover { border-color: #7fe2b7; color: #e5fff3; background: #1b3245; }.font-attachment { min-width: 0; display: flex; align-items: center; gap: 5px; padding: 4px 5px 4px 7px; border: 1px solid #354969; border-radius: 5px; color: #aebcd5; background: #151f32; font-size: .7rem; }.font-attachment-details { min-width: 0; flex: 1; display: grid; gap: 1px; }.font-attachment-name, .font-attachment-filename { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.font-attachment-name { color: #d7e5fa; }.font-attachment-filename { color: #7f91b0; font-size: .66rem; }.font-attachment button { width: 19px; height: 19px; flex: 0 0 19px; padding: 0; border: 0; border-radius: 3px; color: #b8c7e1; background: transparent; font-size: 1rem; line-height: 1; }.font-attachment button:hover { color: #fff; background: #6a3441; }
 .font-subset-option { display: flex; align-items: center; gap: 6px; color: #bcd0ee; font-size: .73rem; cursor: pointer; }.font-subset-option input { width: 14px; height: 14px; margin: 0; accent-color: #7fe2b7; cursor: inherit; }.font-subset-option input:disabled { cursor: wait; }
 .editor-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }.editor-header { padding: 18px 24px 13px; border-bottom: 1px solid #2b3855; }.editor-heading { min-width: 0; flex: 1; }.editor-header h2 { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.editor-header p:not(.eyebrow) { max-width: 570px; margin: 0; color: #98a8c6; font-size: .82rem; line-height: 1.45; }.editor-actions { display: flex; flex: 0 1 auto; align-items: flex-end; gap: 10px; }.subtitle-title-field { min-width: 0; display: grid; gap: 3px; color: #a9b6cf; font-size: .72rem; }.subtitle-title-field input { width: min(240px, 28vw); min-width: 120px; padding: 5px 7px; border: 1px solid #425a87; border-radius: 5px; color: #e5edff; background: #101827; }.subtitle-title-field input:focus { outline: 2px solid #7fe2b7; outline-offset: 1px; }.editor-header .primary { flex: 0 0 auto; padding: 6px 10px; font-size: .8rem; }.timestamp-toolbar, .timestamp-start-row { display: flex; align-items: center; gap: 8px; padding: 8px 24px; color: #a9b6cf; font-size: .8rem; }.timestamp-toolbar { border-bottom: 1px solid #2b3855; }.timestamp-start-row { min-width: 0; align-items: flex-end; padding-top: 6px; padding-bottom: 0; border-bottom: 1px solid #2b3855; }.timestamp-start-label, .timestamp-start-inputs { margin-bottom: 9px; }.timestamp-start-label { white-space: nowrap; }.timestamp-start-inputs { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; }.subtitle-tabs { align-self: stretch; min-width: 0; display: flex; flex: 1; align-items: flex-end; gap: 0; overflow-x: auto; scrollbar-width: none; }.subtitle-tabs::-webkit-scrollbar { display: none; }.subtitle-tab { position: relative; z-index: 0; flex: 0 0 auto; max-width: 132px; margin: 0 0 -1px -1px; overflow: hidden; border: 1px solid #33486e; border-bottom-color: #2b3855; border-radius: 5px 5px 0 0; padding: 7px 9px 8px; color: #9eafcf; background: #18243a; font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }.subtitle-tab:first-child { margin-left: 0; }.subtitle-tab:hover { z-index: 1; border-color: #536987; color: #dbe7ff; background: #223451; }.subtitle-tab.active { z-index: 2; border-color: #6d92d6; border-bottom: 0; padding-bottom: 9px; color: #edf3ff; background: #101827; }.subtitle-tab.dirty { color: #d8f1a6; }.subtitle-tab span { margin-left: 3px; color: #7fe2b7; }.timestamp-toolbar button { border: 1px solid #425a87; border-radius: 5px; padding: 4px 9px; color: #dbe7ff; background: #1d2c48; }.timestamp-toolbar input, .timestamp-start { width: 84px; border: 1px solid #425a87; border-radius: 5px; padding: 4px 7px; color: #e5edff; background: #101827; }.timestamp-start-inputs .timestamp-start { width: 36px; padding: 4px 3px; text-align: center; }.timestamp-start-inputs .milliseconds { width: 44px; } textarea { flex: 1; min-height: 0; resize: none; padding: 20px 24px; border: 0; outline: 0; color: #dfe8fb; background: #101827; font-family: "SFMono-Regular", Consolas, monospace; font-size: .86rem; line-height: 1.6; }.empty-editor { display: grid; flex: 1; min-height: 0; place-content: center; padding: 32px; text-align: center; color: #99a8c4; }.empty-editor h2 { color: #e7edf9; }.empty-editor p { max-width: 430px; margin: 0; line-height: 1.6; }

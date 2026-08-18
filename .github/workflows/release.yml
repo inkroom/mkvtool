@@ -76,6 +76,15 @@ jobs:
           ls ffmpeg-${{ runner.os }} || true
           ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
           npm install
+      - name: Test Version
+        shell: bash
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: |
+          cd src-tauri && cargo test --no-run
+          cp ${{ github.workspace }}/ffmpeg-${{ runner.os }}/bin/ffmpeg ./target/debug/
+          export PATH="$(pwd)/target/debug:$PATH"
+          cargo test
       - name: Build
         uses: tauri-apps/tauri-action@v1
         id: build
@@ -88,11 +97,6 @@ jobs:
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-      - name: Test Version
-        shell: bash
-        run: |
-          cd src-tauri && cargo test
-          ./target/release/mkv -v
 
       - name: Create portable ZIP
         shell: bash
@@ -206,6 +210,17 @@ jobs:
           ls ffmpeg-${{ runner.os }} || true
           ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
           npm install
+      - name: Test Version
+        shell: pwsh
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: |
+          cd src-tauri
+          ls ./binaries
+          cargo test --no-run
+          cp ./binaries/ffm ./target/debug/ffmpeg.exe
+          $env:PATH = "$PWD\target\debug;$env:PATH"
+          cargo test
       - name: Build
         uses: tauri-apps/tauri-action@v1
         id: build
@@ -218,12 +233,6 @@ jobs:
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-      - name: Test Version
-        shell: pwsh
-        run: |
-          cd src-tauri
-          cargo test
-          & .\target\release\mkv.exe -v
       - name: Create portable ZIP
         shell: pwsh
         run: |
@@ -322,12 +331,27 @@ jobs:
           mkdir -p src-tauri/binaries
           cp $prefix/bin/ffmpeg src-tauri/binaries/
           cp $prefix/bin/ffprobe src-tauri/binaries/
+      - name: Upload FFmpeg lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-lib-${{ runner.os }}
+          if-no-files-found: error
+          path: ffmpeg-${{ runner.os }}
       - name: install frontend dependencies
         id: home
         run: |
           ls ffmpeg-${{ runner.os }} || true
           ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}/include || true
           npm install
+      - name: Test Version
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: |
+          cd src-tauri && cargo test --no-run
+          ls -all ./binaries
+          cp ./binaries/ffmpeg ./target/debug/ffmpeg
+          export PATH="$(pwd)/target/debug:$PATH"
+          cargo test
       - name: Build
         uses: tauri-apps/tauri-action@v1
         id: build
@@ -341,11 +365,6 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.rust_target }}
-      - name: Test Version
-        run: |
-          cd src-tauri && cargo test
-          ./target/release/mkv -v
-
       - name: Create portable macOS ZIP
         shell: bash
         run: |
