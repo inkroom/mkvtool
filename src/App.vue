@@ -12,6 +12,10 @@ const timestampOffset = ref(500);
 const timestampStart = ref({ hours: "00", minutes: "00", seconds: "00", milliseconds: "00" });
 const loading = ref(false);
 const saving = ref(false);
+const pickingMkvFile = ref(false);
+const pickingFontFile = ref(false);
+const pickingOutputFile = ref(false);
+const convertingSubtitleFormat = ref(false);
 const error = ref("");
 const notice = ref("");
 const languageMenuOpen = ref(false);
@@ -130,62 +134,30 @@ function toggleFormatMenu() {
   formatMenuOpen.value = !formatMenuOpen.value;
 }
 
-function assTimestampToSrt(value) {
-  const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})[.:](\d{2})$/);
-  if (!match) return value.trim();
-  const [, hours, minutes, seconds, centiseconds] = match;
-  return `${hours.padStart(2, "0")}:${minutes}:${seconds},${centiseconds}0`;
-}
-
-function srtTimestampToAss(value) {
-  const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})[,.](\d{3})$/);
-  if (!match) return value.trim();
-  const [, hours, minutes, seconds, milliseconds] = match;
-  return `${Number(hours)}:${minutes}:${seconds}.${String(Math.floor(Number(milliseconds) / 10)).padStart(2, "0")}`;
-}
-
-function assToSrt(content) {
-  const entries = [];
-  for (const match of content.replace(/\r/g, "").matchAll(/^Dialogue:\s*(.*)$/gm)) {
-    const fields = match[1].split(",");
-    if (fields.length < 10) continue;
-    const text = fields.slice(9).join(",").replace(/\{[^}]*\}/g, "").replace(/\\[Nn]/g, "\n");
-    entries.push(`${assTimestampToSrt(fields[1])} --> ${assTimestampToSrt(fields[2])}\n${text}`);
-  }
-  return entries.map((entry, index) => `${index + 1}\n${entry}`).join("\n\n") + (entries.length ? "\n" : "");
-}
-
-function srtToAss(content) {
-  const entries = [];
-  const blocks = content.replace(/\r/g, "").trim().split(/\n\s*\n/);
-  for (const block of blocks) {
-    const lines = block.split("\n");
-    const timestampIndex = lines.findIndex((line) => /-->/.test(line));
-    if (timestampIndex < 0) continue;
-    const match = lines[timestampIndex].match(/([^\s]+)\s*-->\s*([^\s]+)/);
-    if (!match) continue;
-    const text = lines.slice(timestampIndex + 1).join("\\N").replace(/\r/g, "");
-    entries.push(`Dialogue: 0,${srtTimestampToAss(match[1])},${srtTimestampToAss(match[2])},Default,,0,0,0,,${text}`);
-  }
-  return `[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${entries.join("\n")}\n`;
-}
-
-function convertSubtitleFormat(content, from, to) {
-  if (from === to) return content;
-  return from === "ass" && to === "srt" ? assToSrt(content) : srtToAss(content);
-}
-
-function changeSubtitleFormat(format) {
-  if (!activeTab.value || !subtitleFormats.some((option) => option.value === format)) return;
+async function changeSubtitleFormat(format) {
+  if (convertingSubtitleFormat.value || !activeTab.value || !subtitleFormats.some((option) => option.value === format)) return;
   const tab = activeTab.value;
-  if (tab.format !== format) {
+  if (tab.format === format) {
+    formatMenuOpen.value = false;
+    return;
+  }
+  convertingSubtitleFormat.value = true;
+  try {
     tab.content = format === tab.originalFormat
       ? tab.originalContent
-      : convertSubtitleFormat(tab.content, tab.format, format);
+      : await invoke("convert_subtitle_format", {
+        content: tab.content,
+        sourceFormat: tab.format,
+        targetFormat: format,
+      });
     tab.format = format;
     updateTabDirty(tab);
+    formatMenuOpen.value = false;
+  } catch (reason) {
+    showError(reason);
+  } finally {
+    convertingSubtitleFormat.value = false;
   }
-  formatMenuOpen.value = false;
 }
 
 function closeLanguageMenu(event) {
@@ -286,15 +258,21 @@ function createSubtitle() {
 }
 
 async function chooseFile() {
+  if (pickingMkvFile.value) return;
+  pickingMkvFile.value = true;
   try {
-   const path = await invoke("pick_mkv_file");
+    const path = await invoke("pick_mkv_file");
     await loadFile(path);
   } catch (reason) {
     showError(reason);
+  } finally {
+    pickingMkvFile.value = false;
   }
 }
 
 async function chooseFontAttachment() {
+  if (pickingFontFile.value) return;
+  pickingFontFile.value = true;
   try {
     const path = await invoke("pick_font_file");
     if (!path || fontAttachments.value.some((font) => font.path === path)) return;
@@ -307,6 +285,8 @@ async function chooseFontAttachment() {
     });
   } catch (reason) {
     showError(reason);
+  } finally {
+    pickingFontFile.value = false;
   }
 }
 
@@ -400,7 +380,7 @@ function scrollSubtitleTabs(event) {
 }
 
 async function saveSubtitle() {
-  if (!media.value) return;
+  if (!media.value || pickingOutputFile.value) return;
   const selectedStreamIndices = media.value.streams
     .filter((stream) => stream.selected)
     .map((stream) => stream.index);
@@ -440,7 +420,13 @@ async function saveSubtitle() {
     : null;
   try {
     const defaultName = media.value.name.replace(/\.mkv$/i, "") + "-edited.mkv";
-    const outputPath = await invoke("pick_output_file", { suggestedName: defaultName });
+    pickingOutputFile.value = true;
+    let outputPath;
+    try {
+      outputPath = await invoke("pick_output_file", { suggestedName: defaultName });
+    } finally {
+      pickingOutputFile.value = false;
+    }
     if (!outputPath) return;
     saving.value = true;
     error.value = "";
@@ -634,10 +620,10 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <section v-if="!media" class="drop-zone" @click="chooseFile">
+    <section v-if="!media" class="drop-zone" :class="{ disabled: pickingMkvFile }" @click="chooseFile">
       <div class="drop-icon">↓</div>
       <h2>拖放 MKV 文件到这里</h2>
-      <p>或点击此处打开文件选择框</p>
+      <p>{{ pickingMkvFile ? "正在选择文件…" : "或点击此处打开文件选择框" }}</p>
     </section>
 
     <p v-if="error" class="message error">{{ error }}</p>
@@ -654,8 +640,8 @@ onBeforeUnmount(() => {
             <strong :title="media.name" :aria-label="media.name">{{ media.name }}</strong>
             <div class="file-details">
               <small>{{ duration }} · {{ media.streams.length }} 条流</small>
-              <button class="choose-file" :disabled="busy" @click="chooseFile">
-                {{ loading ? "正在读取…" : "选择 MKV" }}
+              <button class="choose-file" :disabled="busy || pickingMkvFile" @click="chooseFile">
+                {{ pickingMkvFile ? "正在选择…" : (loading ? "正在读取…" : "选择 MKV") }}
               </button>
             </div>
           </div>
@@ -723,7 +709,7 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <div v-if="type === 'attachment'" class="font-attachments">
-              <button class="add-font-attachment" type="button" :disabled="busy" @click="chooseFontAttachment">选择字体文件</button>
+              <button class="add-font-attachment" type="button" :disabled="busy || pickingFontFile" @click="chooseFontAttachment">{{ pickingFontFile ? "正在选择…" : "选择字体文件" }}</button>
               <label v-if="fontAttachments.length" class="font-subset-option">
                 <input v-model="subsetFonts" type="checkbox" :disabled="busy" />
                 <span>字体子集化</span>
@@ -750,8 +736,8 @@ onBeforeUnmount(() => {
               <label class="subtitle-title-field">
                 <input v-model="subtitleTitle" :disabled="busy" type="text" aria-label="字幕标题" placeholder="未命名" />
               </label>
-              <button class="primary" :disabled="busy" @click="saveSubtitle">
-                {{ saving ? "正在重新混流…" : "导出 MKV" }}
+              <button class="primary" :disabled="busy || pickingOutputFile" @click="saveSubtitle">
+                {{ pickingOutputFile ? "正在选择位置…" : (saving ? "正在重新混流…" : "导出 MKV") }}
               </button>
             </div>
           </div>
@@ -799,6 +785,7 @@ onBeforeUnmount(() => {
                 aria-haspopup="listbox"
                 :aria-expanded="formatMenuOpen"
                 aria-controls="subtitle-format-options"
+                :disabled="convertingSubtitleFormat"
                 @click="toggleFormatMenu"
               >
                 <span class="language-picker-label">{{ subtitleFormatLabel }}</span>
@@ -813,6 +800,7 @@ onBeforeUnmount(() => {
                   type="button"
                   role="option"
                   :aria-selected="subtitleFormat === option.value"
+                  :disabled="convertingSubtitleFormat"
                   @click="changeSubtitleFormat(option.value)"
                 >
                   {{ option.label }}
@@ -892,7 +880,7 @@ button:disabled { cursor: wait; opacity: .65; }
 h2, p { margin-top: 0; } h2 { font-size: 1.1rem; }
 .primary { border: 0; border-radius: 9px; padding: 8px 12px; color: #061323; background: #7fe2b7; font-weight: 800; box-shadow: 0 7px 20px #0004; }
 .drop-zone { flex: 1; min-height: 0; display: grid; place-content: center; text-align: center; padding: 48px; border: 1px dashed #6d86b7; background: #121b30a8; color: #aebad1; transition: .2s; }
-.drop-zone:hover { border-color: #7fe2b7; background: #15233c; } .drop-zone h2 { color: #edf2ff; margin-bottom: 8px; } .drop-zone p { max-width: 520px; margin: 0; line-height: 1.6; }
+.drop-zone:hover { border-color: #7fe2b7; background: #15233c; } .drop-zone.disabled { cursor: wait; opacity: .65; } .drop-zone.disabled:hover { border-color: #6d86b7; background: #121b30a8; } .drop-zone h2 { color: #edf2ff; margin-bottom: 8px; } .drop-zone p { max-width: 520px; margin: 0; line-height: 1.6; }
 .drop-icon { width: 46px; height: 46px; display: grid; place-items: center; margin: 0 auto 18px; border-radius: 50%; font-size: 1.8rem; background: #24375c; color: #7fe2b7; }
 .message { margin: 0; padding: 10px 13px; border-radius: 0; white-space: pre-wrap; }.error { color: #ffc6c6; background: #4b202b; }.notice { position: fixed; z-index: 9; top: 46px; right: 18px; display: flex; align-items: center; gap: 12px; max-width: min(440px, calc(100vw - 36px)); padding: 10px 10px 10px 14px; border: 1px solid #368568; border-radius: 8px; color: #b7f6d7; background: #173d35; box-shadow: 0 12px 32px #0006; }.notice-close { width: 24px; height: 24px; flex: 0 0 24px; padding: 0; border: 0; border-radius: 5px; color: #d5ffe8; background: transparent; font-size: 1.2rem; line-height: 1; }.notice-close:hover { background: #28604f; }
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 340px minmax(420px, 1fr); overflow: hidden; background: #11192a; }

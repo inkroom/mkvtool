@@ -57,6 +57,8 @@ async function invokeMock(command, arguments_) {
       if (!subtitle) throw new Error("演示字幕流不存在。");
       return structuredClone(subtitle);
     }
+    case "convert_subtitle_format":
+      throw new Error("浏览器演示环境不支持字幕格式转换，请使用桌面应用。");
     case "pick_output_file":
       return `浏览器演示-${arguments_.suggestedName}`;
     case "save_subtitles":

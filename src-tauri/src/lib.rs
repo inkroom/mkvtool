@@ -81,6 +81,19 @@ struct FontAttachment {
     content: Option<Vec<u8>>,
 }
 
+/// Parameters for the command-line subtitle conversion workflow.
+pub struct CliSubtitleConversionOptions {
+    pub input: PathBuf,
+    pub attachments: Vec<PathBuf>,
+    pub subtitle_stream_indices: Vec<u32>,
+    pub target_format: String,
+    pub font_name: Option<String>,
+    pub automatic_font_name: bool,
+    pub font_size: u32,
+    pub output: PathBuf,
+    pub subset_fonts: bool,
+}
+
 trait FfmpegService: Send + Sync {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String>;
     fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String>;
@@ -323,7 +336,7 @@ impl FFIFfmpegService {
     fn add_new_subtitle_stream(
         output: &mut ffmpeg_next::format::context::Output,
         edit: &SubtitleEdit,
-        default_subtitle_stream_index: Option<u32>,
+        is_default: bool,
     ) -> Result<usize, String> {
         let format = edit
             .format
@@ -368,7 +381,7 @@ impl FFIFfmpegService {
         unsafe {
             let stream = &mut *stream.as_mut_ptr();
             stream.disposition &= !ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
-            if default_subtitle_stream_index == Some(NEW_SUBTITLE_STREAM_INDEX) {
+            if is_default {
                 stream.disposition |= ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
             }
         }
@@ -644,6 +657,169 @@ impl FFIFfmpegService {
             "{hours:02}:{minutes:02}:{seconds:02},{:03}",
             milliseconds % 1_000
         )
+    }
+
+    fn ass_timestamp_to_srt(timestamp: &str) -> Result<String, String> {
+        let (hours, minutes, seconds_and_centiseconds) = timestamp
+            .trim()
+            .split_once(':')
+            .and_then(|(hours, remainder)| {
+                remainder
+                    .split_once(':')
+                    .map(|(minutes, seconds)| (hours, minutes, seconds))
+            })
+            .ok_or_else(|| format!("ASS 字幕时间格式无效：{timestamp}"))?;
+        let (seconds, centiseconds) = seconds_and_centiseconds
+            .split_once('.')
+            .or_else(|| seconds_and_centiseconds.split_once(':'))
+            .ok_or_else(|| format!("ASS 字幕时间格式无效：{timestamp}"))?;
+        let hours = hours
+            .parse::<u64>()
+            .map_err(|_| format!("ASS 字幕时间格式无效：{timestamp}"))?;
+        let minutes = minutes
+            .parse::<u64>()
+            .map_err(|_| format!("ASS 字幕时间格式无效：{timestamp}"))?;
+        let seconds = seconds
+            .parse::<u64>()
+            .map_err(|_| format!("ASS 字幕时间格式无效：{timestamp}"))?;
+        let centiseconds = centiseconds
+            .parse::<u64>()
+            .map_err(|_| format!("ASS 字幕时间格式无效：{timestamp}"))?;
+        if minutes >= 60 || seconds >= 60 || centiseconds >= 100 {
+            return Err(format!("ASS 字幕时间格式无效：{timestamp}"));
+        }
+        Ok(format!(
+            "{hours:02}:{minutes:02}:{seconds:02},{centiseconds:02}0"
+        ))
+    }
+
+    fn srt_timestamp_to_ass(timestamp: &str) -> Result<String, String> {
+        let (hours, minutes, seconds_and_milliseconds) = timestamp
+            .trim()
+            .split_once(':')
+            .and_then(|(hours, remainder)| {
+                remainder
+                    .split_once(':')
+                    .map(|(minutes, seconds)| (hours, minutes, seconds))
+            })
+            .ok_or_else(|| format!("SRT 字幕时间格式无效：{timestamp}"))?;
+        let (seconds, milliseconds) = seconds_and_milliseconds
+            .split_once(',')
+            .or_else(|| seconds_and_milliseconds.split_once('.'))
+            .ok_or_else(|| format!("SRT 字幕时间格式无效：{timestamp}"))?;
+        let hours = hours
+            .parse::<u64>()
+            .map_err(|_| format!("SRT 字幕时间格式无效：{timestamp}"))?;
+        let minutes = minutes
+            .parse::<u64>()
+            .map_err(|_| format!("SRT 字幕时间格式无效：{timestamp}"))?;
+        let seconds = seconds
+            .parse::<u64>()
+            .map_err(|_| format!("SRT 字幕时间格式无效：{timestamp}"))?;
+        let milliseconds = milliseconds
+            .parse::<u64>()
+            .map_err(|_| format!("SRT 字幕时间格式无效：{timestamp}"))?;
+        if minutes >= 60 || seconds >= 60 || milliseconds >= 1_000 {
+            return Err(format!("SRT 字幕时间格式无效：{timestamp}"));
+        }
+        Ok(format!(
+            "{hours}:{minutes:02}:{seconds:02}.{:02}",
+            milliseconds / 10
+        ))
+    }
+
+    fn ass_text_to_srt(text: &str) -> String {
+        let mut content = String::new();
+        let mut in_override = false;
+        for character in text.chars() {
+            match character {
+                '{' => in_override = true,
+                '}' if in_override => in_override = false,
+                _ if !in_override => content.push(character),
+                _ => {}
+            }
+        }
+        content.replace("\\N", "\n").replace("\\n", "\n")
+    }
+
+    fn ass_to_srt(content: &str) -> Result<String, String> {
+        let mut entries = Vec::new();
+        for line in normalize_srt_line_endings(content.to_string()).lines() {
+            let Some(dialogue) = line.strip_prefix("Dialogue:") else {
+                continue;
+            };
+            let fields = dialogue.splitn(10, ',').collect::<Vec<_>>();
+            if fields.len() != 10 {
+                return Err(format!("ASS 字幕事件格式无效：{line}"));
+            }
+            entries.push(format!(
+                "{}\n{} --> {}\n{}",
+                entries.len() + 1,
+                Self::ass_timestamp_to_srt(fields[1])?,
+                Self::ass_timestamp_to_srt(fields[2])?,
+                Self::ass_text_to_srt(fields[9]),
+            ));
+        }
+        if entries.is_empty() {
+            return Err("ASS 字幕不包含 Dialogue 事件。".to_string());
+        }
+        Ok(format!("{}\n", entries.join("\n\n")))
+    }
+
+    fn srt_to_ass(content: &str) -> Result<String, String> {
+        Self::srt_to_ass_with_style(content, "Arial", 20)
+    }
+
+    fn srt_to_ass_with_style(
+        content: &str,
+        font_name: &str,
+        font_size: u32,
+    ) -> Result<String, String> {
+        if font_name.trim().is_empty() || font_name.contains([',', '\r', '\n']) {
+            return Err("ASS 字体名不能为空，且不能包含逗号或换行。".to_string());
+        }
+        if font_size == 0 {
+            return Err("ASS 字体大小必须大于 0。".to_string());
+        }
+        let lines = normalize_srt_line_endings(content.to_string())
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut dialogues = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let Some(timestamp_offset) =
+                lines[index..].iter().position(|line| line.contains("-->"))
+            else {
+                break;
+            };
+            let timestamp_index = index + timestamp_offset;
+            let (start, end) = lines[timestamp_index]
+                .split_once("-->")
+                .ok_or_else(|| format!("SRT 字幕时间格式无效：{}", lines[timestamp_index]))?;
+            let end = end.split_whitespace().next().unwrap_or(end);
+            let mut end_index = timestamp_index + 1;
+            while end_index < lines.len() && !lines[end_index].is_empty() {
+                end_index += 1;
+            }
+            let text = lines[timestamp_index + 1..end_index].join("\\N");
+            if !text.is_empty() {
+                dialogues.push(format!(
+                    "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+                    Self::srt_timestamp_to_ass(start)?,
+                    Self::srt_timestamp_to_ass(end)?,
+                    text,
+                ));
+            }
+            index = end_index.saturating_add(1);
+        }
+        if dialogues.is_empty() {
+            return Err("SRT 字幕不包含文本事件。".to_string());
+        }
+        Ok(format!(
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n{}\n",
+            dialogues.join("\n")
+        ))
     }
 
     fn ass_text_as_html(dialogue: &str) -> String {
@@ -933,13 +1109,11 @@ impl FfmpegService for FFIFfmpegService {
             return Err("请至少选择一条要导出的流。".to_string());
         }
         let mut replacements = HashMap::new();
-        let mut new_subtitle = None;
+        let mut new_subtitles = Vec::new();
         for edit in edits {
             validate_new_subtitle_edit(edit)?;
             if edit.new_stream {
-                if new_subtitle.replace(edit).is_some() {
-                    return Err("一次只能新建一条字幕流。".to_string());
-                }
+                new_subtitles.push(edit);
                 continue;
             }
             if replacements
@@ -962,7 +1136,7 @@ impl FfmpegService for FFIFfmpegService {
             }
         }
         if let Some(default_stream_index) = default_subtitle_stream_index {
-            if new_subtitle.is_some() && default_stream_index == NEW_SUBTITLE_STREAM_INDEX {
+            if !new_subtitles.is_empty() && default_stream_index == NEW_SUBTITLE_STREAM_INDEX {
                 if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
                     return Err("默认字幕必须是要导出的字幕流。".to_string());
                 }
@@ -983,24 +1157,24 @@ impl FfmpegService for FFIFfmpegService {
             .map_err(|error| format!("无法创建输出文件：{error}"))?;
         output.set_metadata(input.metadata().to_owned());
         let mut output_indices = HashMap::new();
+        let mut new_subtitle_output_indices = Vec::with_capacity(new_subtitles.len());
         for stream in input.streams() {
             if !selected_streams.contains(&stream.index()) {
                 continue;
             }
             if stream.parameters().medium() == ffmpeg_next::media::Type::Subtitle {
-                if let Some(edit) = new_subtitle.as_ref() {
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        output_indices.entry(NEW_SUBTITLE_STREAM_INDEX as usize)
-                    {
-                        if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
-                            return Err("新建字幕必须被选择导出。".to_string());
-                        }
+                if !new_subtitles.is_empty() && new_subtitle_output_indices.is_empty() {
+                    if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
+                        return Err("新建字幕必须被选择导出。".to_string());
+                    }
+                    for (position, edit) in new_subtitles.iter().enumerate() {
                         let index = Self::add_new_subtitle_stream(
                             &mut output,
                             edit,
-                            default_subtitle_stream_index,
+                            default_subtitle_stream_index == Some(NEW_SUBTITLE_STREAM_INDEX)
+                                && position == 0,
                         )?;
-                        e.insert(index);
+                        new_subtitle_output_indices.push(index);
                     }
                 }
             }
@@ -1071,19 +1245,18 @@ impl FfmpegService for FFIFfmpegService {
             }
             output_indices.insert(stream.index(), output_stream.index());
         }
-        if let Some(edit) = new_subtitle.as_ref() {
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                output_indices.entry(NEW_SUBTITLE_STREAM_INDEX as usize)
-            {
-                if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
-                    return Err("新建字幕必须被选择导出。".to_string());
-                }
+        if !new_subtitles.is_empty() && new_subtitle_output_indices.is_empty() {
+            if !selected_streams.contains(&(NEW_SUBTITLE_STREAM_INDEX as usize)) {
+                return Err("新建字幕必须被选择导出。".to_string());
+            }
+            for (position, edit) in new_subtitles.iter().enumerate() {
                 let index = Self::add_new_subtitle_stream(
                     &mut output,
                     edit,
-                    default_subtitle_stream_index,
+                    default_subtitle_stream_index == Some(NEW_SUBTITLE_STREAM_INDEX)
+                        && position == 0,
                 )?;
-                e.insert(index);
+                new_subtitle_output_indices.push(index);
             }
         }
         for font in font_attachments {
@@ -1124,8 +1297,8 @@ impl FfmpegService for FFIFfmpegService {
             .write_header()
             .map_err(|error| format!("无法写入 MKV 头：{error}"))?;
 
-        if let Some(edit) = new_subtitle.as_ref() {
-            let output_index = output_indices[&(NEW_SUBTITLE_STREAM_INDEX as usize)];
+        for (position, edit) in new_subtitles.iter().enumerate() {
+            let output_index = new_subtitle_output_indices[position];
             let format = edit
                 .format
                 .as_deref()
@@ -1225,6 +1398,462 @@ impl FfmpegService for FFIFfmpegService {
     }
 }
 
+/// Converts an editable subtitle document between ASS and SRT.
+///
+/// Kept outside the FFmpeg service so callers do not need to select a backend merely to
+/// transform subtitle text.
+pub fn convert_subtitle_format(
+    content: String,
+    source_format: &str,
+    target_format: &str,
+) -> Result<String, String> {
+    match (source_format, target_format) {
+        ("ass", "srt") => FFIFfmpegService::ass_to_srt(&content),
+        ("srt", "ass") => FFIFfmpegService::srt_to_ass(&content),
+        ("ass" | "srt", format) => Err(format!("不支持转换为 {format} 字幕格式。")),
+        (format, _) => Err(format!("不支持 {format} 字幕格式。")),
+    }
+}
+
+fn convert_subtitle_format_with_ass_style(
+    content: String,
+    source_format: &str,
+    target_format: &str,
+    font_name: &str,
+    font_size: u32,
+) -> Result<String, String> {
+    match (source_format, target_format) {
+        (source, target) if source == target => Ok(content),
+        ("srt", "ass") => FFIFfmpegService::srt_to_ass_with_style(&content, font_name, font_size),
+        _ => convert_subtitle_format(content, source_format, target_format),
+    }
+}
+
+/// Converts selected subtitle streams through the active remux service.
+///
+/// The existing service can insert one subtitle per remux. Processing source subtitles in reverse
+/// stream order places each new stream before the originals while preserving their original order.
+pub fn convert_subtitle_streams_for_cli(
+    options: CliSubtitleConversionOptions,
+) -> Result<(), String> {
+    if options.input == options.output {
+        return Err("输出文件不能覆盖输入文件。".to_string());
+    }
+    if !options
+        .output
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mkv"))
+    {
+        return Err("输出文件必须使用 .mkv 扩展名。".to_string());
+    }
+    let target_format = options.target_format.to_ascii_lowercase();
+    if !matches!(target_format.as_str(), "ass" | "srt") {
+        return Err("字幕格式只能是 ass 或 srt。".to_string());
+    }
+    if options.subtitle_stream_indices.is_empty() {
+        return Err("请至少指定一个字幕流索引。".to_string());
+    }
+    if options.font_size == 0 {
+        return Err("字体大小必须大于 0。".to_string());
+    }
+    let automatic_font_name = if let Some(font) = options.font_name {
+        font.clone()
+    } else if options.automatic_font_name && !options.attachments.is_empty() {
+        let path = options
+            .attachments
+            .first()
+            .ok_or_else(|| "自动字体需要至少添加一个字体附件。".to_string())?;
+        let data = fs::read(path)
+            .map_err(|error| format!("无法读取字体文件 {}：{error}", path.display()))?;
+        let name = font::dump(&data);
+        (!name.trim().is_empty())
+            .then_some(name)
+            .ok_or_else(|| format!("无法从字体文件 {} 读取字体名。", path.display()))?
+    } else {
+        "Arial".to_string()
+    };
+    let font_name = automatic_font_name.as_str();
+    if font_name.trim().is_empty() || font_name.contains([',', '\r', '\n']) {
+        return Err("ASS 字体名不能为空，且不能包含逗号或换行。".to_string());
+    }
+
+    let service = if cfg!(test) {
+        ActiveFfmpegService::Ffi(FFIFfmpegService {})
+    } else {
+        ActiveFfmpegService::new()
+    };
+    let requested = options
+        .subtitle_stream_indices
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let media = service.inspect(&options.input)?;
+    let selected = media
+        .streams
+        .iter()
+        .filter(|stream| requested.contains(&stream.index))
+        .collect::<Vec<_>>();
+    if selected.len() != requested.len() {
+        return Err("未找到所选字幕流。".to_string());
+    }
+    if selected.iter().any(|stream| !stream.editable) {
+        return Err("只能转换可编辑的文本字幕流。".to_string());
+    }
+    let mut subtitles = Vec::with_capacity(selected.len());
+    for stream in selected {
+        let document = stream
+            .subtitle
+            .clone()
+            .unwrap_or(service.read_subtitle(&options.input, stream.index)?);
+        subtitles.push(SubtitleEdit {
+            stream_index: NEW_SUBTITLE_STREAM_INDEX,
+            content: convert_subtitle_format_with_ass_style(
+                document.content,
+                &document.format,
+                &target_format,
+                font_name,
+                options.font_size,
+            )?,
+            format: Some(target_format.clone()),
+            language: Some(stream.language.clone().unwrap_or_else(|| "und".to_string())),
+            title: Some(
+                stream
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| format!("转换字幕 #{}", stream.index)),
+            ),
+            new_stream: true,
+        });
+    }
+
+    let mut fonts = options
+        .attachments
+        .iter()
+        .map(|path| FontAttachment {
+            path: path.display().to_string(),
+            content: None,
+        })
+        .collect::<Vec<_>>();
+    if options.subset_fonts {
+        let text = subtitles
+            .iter()
+            .map(|subtitle| subtitle.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for font in &mut fonts {
+            font.content = Some(
+                font::subset_text_from_path(&font.path, &text)
+                    .ok_or_else(|| format!("无法子集化字体文件 {}。", font.path))?,
+            );
+        }
+    }
+
+    let mut selected_stream_indices = media
+        .streams
+        .iter()
+        .map(|stream| stream.index)
+        .collect::<Vec<_>>();
+    selected_stream_indices.push(NEW_SUBTITLE_STREAM_INDEX);
+    service.remux_subtitles(
+        &options.input,
+        &options.output,
+        &subtitles,
+        &selected_stream_indices,
+        Some(NEW_SUBTITLE_STREAM_INDEX),
+        &fonts,
+    )
+}
+
+#[allow(dead_code)]
+struct CliNewSubtitle {
+    content: String,
+    format: String,
+    language: String,
+    title: String,
+}
+
+#[allow(dead_code)]
+fn add_cli_subtitle_stream(
+    output: &mut ffmpeg_next::format::context::Output,
+    subtitle: &CliNewSubtitle,
+    is_default: bool,
+) -> Result<usize, String> {
+    let mut parameters = ffmpeg_next::codec::Parameters::new();
+    unsafe {
+        let parameters = &mut *parameters.as_mut_ptr();
+        parameters.codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE;
+        parameters.codec_id =
+            subtitle_codec_id(&subtitle.format).expect("validated command-line subtitle format");
+        if subtitle.format == "ass" {
+            let (header, _) = FFIFfmpegService::ass_document_parts(&subtitle.content)?;
+            let header = header.replace("\r\n", "\n").replace('\n', "\r\n");
+            parameters.extradata_size = header.len() as i32;
+            parameters.extradata = ffmpeg_next::ffi::av_mallocz(
+                header.len() + ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+            ) as *mut u8;
+            if parameters.extradata.is_null() {
+                return Err("无法为 ASS 字幕头分配内存。".to_string());
+            }
+            std::ptr::copy_nonoverlapping(header.as_ptr(), parameters.extradata, header.len());
+        }
+    }
+    let context = ffmpeg_next::codec::context::Context::from_parameters(parameters)
+        .map_err(|error| format!("无法创建新字幕流：{error}"))?;
+    let mut stream = output
+        .add_stream_with(&context)
+        .map_err(|error| format!("无法创建新字幕流：{error}"))?;
+    stream.set_time_base(ffmpeg_next::Rational::new(1, 1_000));
+    let mut metadata = ffmpeg_next::Dictionary::new();
+    metadata.set("language", &subtitle.language);
+    metadata.set("title", &subtitle.title);
+    stream.set_metadata(metadata);
+    unsafe {
+        let stream = &mut *stream.as_mut_ptr();
+        stream.disposition &= !ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
+        if is_default {
+            stream.disposition |= ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
+        }
+    }
+    Ok(stream.index())
+}
+
+/// Converts selected subtitle streams and writes them before the input's original subtitle streams.
+/// This intentionally always uses the linked FFmpeg implementation so the command works without an
+/// `ffmpeg` executable beside the application.
+#[allow(dead_code)]
+fn convert_subtitle_streams_for_cli_ffi_legacy(
+    options: CliSubtitleConversionOptions,
+) -> Result<(), String> {
+    FFIFfmpegService::initialize()?;
+    if options.input == options.output {
+        return Err("输出文件不能覆盖输入文件。".to_string());
+    }
+    if !options
+        .output
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mkv"))
+    {
+        return Err("输出文件必须使用 .mkv 扩展名。".to_string());
+    }
+    let target_format = options.target_format.to_ascii_lowercase();
+    if subtitle_codec_id(&target_format).is_none() {
+        return Err("字幕格式只能是 ass 或 srt。".to_string());
+    }
+    if options.subtitle_stream_indices.is_empty() {
+        return Err("请至少指定一个字幕流索引。".to_string());
+    }
+    if options.font_size == 0 {
+        return Err("字体大小必须大于 0。".to_string());
+    }
+    let ass_font_name = options.font_name.as_deref().unwrap_or("Arial");
+    if ass_font_name.trim().is_empty() || ass_font_name.contains([',', '\r', '\n']) {
+        return Err("ASS 字体名不能为空，且不能包含逗号或换行。".to_string());
+    }
+
+    let mut reader = ffmpeg_next::format::input(&options.input)
+        .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+    let requested = options
+        .subtitle_stream_indices
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut selected = reader
+        .streams()
+        .filter(|stream| requested.contains(&(stream.index() as u32)))
+        .map(|stream| stream.index() as u32)
+        .collect::<Vec<_>>();
+    if selected.len() != requested.len() {
+        return Err("未找到所选字幕流。".to_string());
+    }
+    selected.sort_unstable();
+    for index in &selected {
+        let stream = reader
+            .streams()
+            .find(|stream| stream.index() == *index as usize)
+            .expect("selected stream exists");
+        if stream.parameters().medium() != ffmpeg_next::media::Type::Subtitle
+            || subtitle_specification(stream.parameters().id().name()).is_none()
+        {
+            return Err(format!("流 #{index} 不是可转换的文本字幕流。"));
+        }
+    }
+    let documents = FFIFfmpegService::read_subtitles(&mut reader, &selected)?;
+
+    let metadata_input = ffmpeg_next::format::input(&options.input)
+        .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+    let mut new_subtitles = Vec::with_capacity(selected.len());
+    for index in &selected {
+        let document = documents.get(index).expect("selected subtitle was read");
+        let content = match (document.format.as_str(), target_format.as_str()) {
+            (source, target) if source == target => document.content.clone(),
+            ("ass", "srt") => FFIFfmpegService::ass_to_srt(&document.content)?,
+            ("srt", "ass") => FFIFfmpegService::srt_to_ass_with_style(
+                &document.content,
+                ass_font_name,
+                options.font_size,
+            )?,
+            (source, _) => return Err(format!("不支持将 {source} 字幕转换为 {target_format}。")),
+        };
+        let stream = metadata_input
+            .streams()
+            .find(|stream| stream.index() == *index as usize)
+            .expect("selected stream exists");
+        let metadata = stream.metadata();
+        new_subtitles.push(CliNewSubtitle {
+            content,
+            format: target_format.clone(),
+            language: metadata.get("language").unwrap_or("und").to_string(),
+            title: metadata.get("title").unwrap_or("").to_string(),
+        });
+    }
+    drop(metadata_input);
+
+    let mut fonts = options
+        .attachments
+        .into_iter()
+        .map(|path| FontAttachment {
+            path: path.display().to_string(),
+            content: None,
+        })
+        .collect::<Vec<_>>();
+    if options.subset_fonts {
+        let text = new_subtitles
+            .iter()
+            .map(|subtitle| subtitle.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for font in &mut fonts {
+            font.content = Some(
+                font::subset_text_from_path(&font.path, &text)
+                    .ok_or_else(|| format!("无法子集化字体文件 {}。", font.path))?,
+            );
+        }
+    }
+
+    let mut input = ffmpeg_next::format::input(&options.input)
+        .map_err(|error| format!("无法读取媒体文件：{error}"))?;
+    let mut output = ffmpeg_next::format::output(&options.output)
+        .map_err(|error| format!("无法创建输出文件：{error}"))?;
+    output.set_metadata(input.metadata().to_owned());
+    let mut output_indices = HashMap::new();
+    let mut new_output_indices = Vec::with_capacity(new_subtitles.len());
+    let mut inserted_new_subtitles = false;
+    for stream in input.streams() {
+        if !inserted_new_subtitles
+            && stream.parameters().medium() == ffmpeg_next::media::Type::Subtitle
+        {
+            for (position, subtitle) in new_subtitles.iter().enumerate() {
+                new_output_indices.push(add_cli_subtitle_stream(
+                    &mut output,
+                    subtitle,
+                    position == 0,
+                )?);
+            }
+            inserted_new_subtitles = true;
+        }
+        let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|error| format!("无法复制流参数：{error}"))?;
+        let mut output_stream = output
+            .add_stream_with(&context)
+            .map_err(|error| format!("无法创建输出流：{error}"))?;
+        output_stream.set_time_base(stream.time_base());
+        output_stream.set_metadata(stream.metadata().to_owned());
+        if stream.parameters().medium() == ffmpeg_next::media::Type::Subtitle {
+            unsafe {
+                (*output_stream.as_mut_ptr()).disposition &=
+                    !ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
+            }
+        }
+        output_indices.insert(stream.index(), output_stream.index());
+    }
+    if !inserted_new_subtitles {
+        for (position, subtitle) in new_subtitles.iter().enumerate() {
+            new_output_indices.push(add_cli_subtitle_stream(
+                &mut output,
+                subtitle,
+                position == 0,
+            )?);
+        }
+    }
+    for font in &fonts {
+        let (filename, mime_type, content) = font_attachment_data(font)?;
+        let mut parameters = ffmpeg_next::codec::Parameters::new();
+        unsafe {
+            let parameters = &mut *parameters.as_mut_ptr();
+            parameters.codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
+            parameters.codec_id = if mime_type == "application/vnd.ms-opentype" {
+                ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_OTF
+            } else {
+                ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_TTF
+            };
+            parameters.extradata_size = content.len() as i32;
+            parameters.extradata = ffmpeg_next::ffi::av_mallocz(
+                content.len() + ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+            ) as *mut u8;
+            if parameters.extradata.is_null() {
+                return Err("无法为字体附件分配内存。".to_string());
+            }
+            std::ptr::copy_nonoverlapping(content.as_ptr(), parameters.extradata, content.len());
+        }
+        let mut attachment = output
+            .add_stream_with(
+                &ffmpeg_next::codec::context::Context::from_parameters(parameters)
+                    .map_err(|error| format!("无法创建字体附件流：{error}"))?,
+            )
+            .map_err(|error| format!("无法创建字体附件流：{error}"))?;
+        let mut metadata = ffmpeg_next::Dictionary::new();
+        metadata.set("filename", &filename);
+        metadata.set("mimetype", mime_type);
+        attachment.set_metadata(metadata);
+    }
+    output
+        .write_header()
+        .map_err(|error| format!("无法写入 MKV 头：{error}"))?;
+    for (subtitle, output_index) in new_subtitles.iter().zip(new_output_indices) {
+        if subtitle.format == "ass" {
+            let (_, dialogues) = FFIFfmpegService::ass_document_parts(&subtitle.content)?;
+            for (dialogue, pts, duration) in
+                FFIFfmpegService::ass_packets(dialogues, ffmpeg_next::Rational::new(1, 1_000))?
+            {
+                let mut packet = ffmpeg_next::Packet::copy(dialogue.as_bytes());
+                packet.set_stream(output_index);
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(pts));
+                packet.set_duration(duration);
+                packet
+                    .write_interleaved(&mut output)
+                    .map_err(|error| format!("无法写入新 ASS 字幕：{error}"))?;
+            }
+        } else {
+            for (text, pts, duration) in FFIFfmpegService::srt_packets(
+                &subtitle.content,
+                ffmpeg_next::Rational::new(1, 1_000),
+            )? {
+                let mut packet = ffmpeg_next::Packet::copy(text.as_bytes());
+                packet.set_stream(output_index);
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(pts));
+                packet.set_duration(duration);
+                packet
+                    .write_interleaved(&mut output)
+                    .map_err(|error| format!("无法写入新 SRT 字幕：{error}"))?;
+            }
+        }
+    }
+    for (stream, mut packet) in input.packets() {
+        if let Some(&output_index) = output_indices.get(&stream.index()) {
+            packet.set_stream(output_index);
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|error| format!("无法写入媒体数据：{error}"))?;
+        }
+    }
+    output
+        .write_trailer()
+        .map_err(|error| format!("无法完成 MKV 写入：{error}"))
+}
+
 struct CliFfmpegService {
     executable: PathBuf,
 }
@@ -1238,7 +1867,8 @@ impl SubtitleServer {
     fn start(edits: &[SubtitleEdit]) -> Result<Self, String> {
         let sources = edits
             .iter()
-            .map(|edit| (format!("/{}", edit.stream_index), edit.content.clone()))
+            .enumerate()
+            .map(|(index, edit)| (format!("/{index}"), edit.content.clone()))
             .collect::<HashMap<_, _>>();
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|error| format!("无法创建字幕输入：{error}"))?;
@@ -1293,8 +1923,8 @@ impl SubtitleServer {
         })
     }
 
-    fn url(&self, stream_index: u32) -> String {
-        format!("{}/{stream_index}", self.base_url)
+    fn url(&self, edit_index: usize) -> String {
+        format!("{}/{edit_index}", self.base_url)
     }
 }
 impl Drop for SubtitleServer {
@@ -1639,12 +2269,13 @@ impl FfmpegService for CliFfmpegService {
         if selected_streams.is_empty() {
             return Err("请至少选择一条要导出的流。".to_string());
         }
-        let new_subtitle = edits.iter().find(|edit| edit.new_stream);
-        if edits.iter().filter(|edit| edit.new_stream).count() > 1 {
-            return Err("一次只能新建一条字幕流。".to_string());
-        }
+        let new_subtitles = edits
+            .iter()
+            .enumerate()
+            .filter(|(_, edit)| edit.new_stream)
+            .collect::<Vec<_>>();
         if let Some(default_stream_index) = default_subtitle_stream_index {
-            if default_stream_index == NEW_SUBTITLE_STREAM_INDEX && new_subtitle.is_some() {
+            if default_stream_index == NEW_SUBTITLE_STREAM_INDEX && !new_subtitles.is_empty() {
                 if !selected_streams.contains(&default_stream_index) {
                     return Err("默认字幕必须是要导出的字幕流。".to_string());
                 }
@@ -1661,7 +2292,7 @@ impl FfmpegService for CliFfmpegService {
         let mut formats = Vec::with_capacity(edits.len());
         for edit in edits {
             validate_new_subtitle_edit(edit)?;
-            if !edited_streams.insert(edit.stream_index) {
+            if !edit.new_stream && !edited_streams.insert(edit.stream_index) {
                 return Err(format!("字幕流 #{} 被重复提交。", edit.stream_index));
             }
             if edit.new_stream {
@@ -1688,10 +2319,10 @@ impl FfmpegService for CliFfmpegService {
 
         let mut command = self.ffmpeg_command();
         command.args(["-v", "error", "-i"]).arg(input);
-        for (edit, format) in edits.iter().zip(formats) {
+        for (edit_index, (_, format)) in edits.iter().zip(formats).enumerate() {
             command
                 .args(["-f", format, "-i"])
-                .arg(subtitle_server.as_ref().unwrap().url(edit.stream_index));
+                .arg(subtitle_server.as_ref().unwrap().url(edit_index));
         }
 
         // Keep each source stream in its original order, replacing edited subtitle streams in place.
@@ -1702,20 +2333,17 @@ impl FfmpegService for CliFfmpegService {
                 continue;
             }
             if candidate.codec_type == MediaStreamType::Subtitle
-                && new_subtitle.is_some()
+                && !new_subtitles.is_empty()
                 && new_output_index.is_none()
             {
-                let Some((input_index, _)) =
-                    edits.iter().enumerate().find(|(_, edit)| edit.new_stream)
-                else {
-                    unreachable!()
-                };
                 if !selected_streams.contains(&NEW_SUBTITLE_STREAM_INDEX) {
                     return Err("新建字幕必须被选择导出。".to_string());
                 }
-                command.args(["-map", &format!("{}:0", input_index + 1)]);
+                for (input_index, _) in &new_subtitles {
+                    command.args(["-map", &format!("{}:0", input_index + 1)]);
+                }
                 new_output_index = Some(mapped_output_index);
-                mapped_output_index += 1;
+                mapped_output_index += new_subtitles.len();
             }
             command.arg("-map");
             if let Some((input_index, _)) = edits
@@ -1729,20 +2357,22 @@ impl FfmpegService for CliFfmpegService {
             }
             mapped_output_index += 1;
         }
-        if let Some((input_index, _)) = edits.iter().enumerate().find(|(_, edit)| edit.new_stream) {
+        if !new_subtitles.is_empty() {
             if new_output_index.is_none() {
                 if !selected_streams.contains(&NEW_SUBTITLE_STREAM_INDEX) {
                     return Err("新建字幕必须被选择导出。".to_string());
                 }
-                command.args(["-map", &format!("{}:0", input_index + 1)]);
+                for (input_index, _) in &new_subtitles {
+                    command.args(["-map", &format!("{}:0", input_index + 1)]);
+                }
                 new_output_index = Some(mapped_output_index);
             }
         }
 
         command.args(["-map_metadata", "0"]);
-        let new_output_offset = usize::from(new_subtitle.is_some());
-        if let Some(edit) = new_subtitle {
-            let output_index = new_output_index.expect("new subtitle must be mapped");
+        let new_output_offset = new_subtitles.len();
+        for (position, (_, edit)) in new_subtitles.iter().enumerate() {
+            let output_index = new_output_index.expect("new subtitle must be mapped") + position;
             command
                 .arg(format!("-metadata:s:{output_index}"))
                 .arg(format!(
@@ -1756,9 +2386,11 @@ impl FfmpegService for CliFfmpegService {
                     "title={}",
                     edit.title.as_deref().expect("validated new subtitle title")
                 ))
-                .arg("-disposition:s:0")
+                .arg(format!("-disposition:s:{position}"))
                 .arg(
-                    if default_subtitle_stream_index == Some(NEW_SUBTITLE_STREAM_INDEX) {
+                    if default_subtitle_stream_index == Some(NEW_SUBTITLE_STREAM_INDEX)
+                        && position == 0
+                    {
                         "+default"
                     } else {
                         "-default"
@@ -1774,9 +2406,6 @@ impl FfmpegService for CliFfmpegService {
         {
             let output_index = output_index
                 + usize::from(new_output_index.is_some_and(|index| index <= output_index));
-            command
-                .arg(format!("-map_metadata:s:{output_index}"))
-                .arg(format!("0:s:{}", candidate.index));
             if let Some(language) = edits
                 .iter()
                 .find(|edit| edit.stream_index == candidate.index)
@@ -2509,6 +3138,20 @@ Input #0, matroska,webm, from 'sample.mkv':
             "Dialogue: 0,0:00:03.26,0:00:05.43,Default,,0,0,0,,第一条字幕"
         );
     }
+
+    #[test]
+    fn converts_ass_and_srt_subtitles() {
+        let ass = "[Script Info]\n\n[Events]\nDialogue: 0,0:00:01.23,0:00:02.45,Default,,0,0,0,,{\\i1}第一行{\\i0}\\N第二行\n";
+        let srt =
+            convert_subtitle_format(ass.to_string(), "ass", "srt").expect("ASS 应能转换为 SRT");
+        assert_eq!(srt, "1\n00:00:01,230 --> 00:00:02,450\n第一行\n第二行\n");
+
+        let converted = convert_subtitle_format(srt, "srt", "ass").expect("SRT 应能转换为 ASS");
+        assert!(converted.starts_with("[Script Info]\n"));
+        assert!(
+            converted.contains("Dialogue: 0,0:00:01.23,0:00:02.45,Default,,0,0,0,,第一行\\N第二行")
+        );
+    }
 }
 
 fn mkv_path(path: &str) -> Result<PathBuf, String> {
@@ -2546,6 +3189,24 @@ async fn read_subtitle(
     tauri::async_runtime::spawn_blocking(move || service.read_subtitle(&path, stream_index))
         .await
         .map_err(|error| format!("读取字幕时出错：{error}"))?
+}
+
+mod subtitle_commands {
+    #[tauri::command]
+    pub async fn convert_subtitle_format(
+        content: String,
+        source_format: String,
+        target_format: String,
+    ) -> Result<String, String> {
+        if source_format == target_format {
+            return Ok(content);
+        }
+        tauri::async_runtime::spawn_blocking(move || {
+            super::convert_subtitle_format(content, &source_format, &target_format)
+        })
+        .await
+        .map_err(|error| format!("转换字幕格式时出错：{error}"))?
+    }
 }
 
 #[tauri::command]
@@ -2637,6 +3298,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             inspect_mkv,
             read_subtitle,
+            subtitle_commands::convert_subtitle_format,
             save_subtitles,
             pick_mkv_file,
             read_font_name,
