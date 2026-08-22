@@ -1,6 +1,6 @@
 FROM debian:bookworm AS build
 ARG FFMPEG_REF=n8.1.2
-ARG TARGETARCH=amd64
+ARG TARGETARCH=linux/amd64
 
 RUN sed -i \
         -e 's|http://deb.debian.org/debian-security|http://repo.huaweicloud.com/debian-security|g' \
@@ -25,10 +25,11 @@ RUN git clone --depth 1 --branch "${FFMPEG_REF}" https://github.com/FFmpeg/FFmpe
 WORKDIR /src/ffmpeg
 
 RUN case "${TARGETARCH}" in \
-        amd64) ffmpeg_arch=x86_64 ;; \
-        arm64) ffmpeg_arch=aarch64 ;; \
+        linux/amd64) ffmpeg_arch=x86_64 ;; \
+        linux/arm64) ffmpeg_arch=aarch64 ;; \
         *) echo "Unsupported Linux architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
+    && echo ${ffmpeg_arch} \
     && ./configure \
         --prefix=/opt/ffmpeg \
         --arch="${ffmpeg_arch}" \

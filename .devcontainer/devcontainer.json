@@ -4,7 +4,8 @@
 		"dockerfile": "Dockerfile.dev"
 	},
 	"overrideCommand":false,
-	"containerEnv": {"VNCPORT":"2222","VNCNAME":"mkv","DISPLAY":":1","VNCPASS":"mkv","FFMPEG_DIR":"${containerWorkspaceFolder}/ffmpeg-Linux","PATH":"${remoteEnv:PATH}:${containerWorkspaceFolder}/ffmpeg-Linux/bin"},
+	"containerEnv": {"VNCPORT":"2222","VNCNAME":"mkv","DISPLAY":":1","VNCPASS":"mkv","FFMPEG_DIR":"${containerWorkspaceFolder}/ffmpeg-Linux"},
+	"remoteEnv":{"PATH":"${containerEnv:PATH}:${containerEnv:FFMPEG_DIR}/bin"},
 	"forwardPorts": [2222],
 	"customizations": {
 		"vscode": {
@@ -20,6 +21,6 @@
 		}
 	},
 	"onCreateCommand":
-		"sh src-tauri/ffmpeg/build-linux.sh && git config user.name $(git --no-pager log --pretty=\"%an\" | head -n 1) && git config user.email $(git --no-pager log --pretty=\"%ce\" | head -n 1) && (test -e src-tauri/binaries || ( if [ \"$(arch)\" = \"aarch64\" ] ; then export F=\"aarch64-unknown-linux-gnu\"; else export F=\"x86_64-unknown-linux-gnu\"; fi && mkdir -p src-tauri/binaries && cp /usr/bin/ffmpeg src-tauri/binaries/ffm-$F && cp /usr/bin/ffprobe src-tauri/binaries/ffp-$F ) ) "
+		"git config user.name $(git --no-pager log --pretty=\"%an\" | head -n 1) && git config user.email $(git --no-pager log --pretty=\"%ce\" | head -n 1) && (test -e src-tauri/binaries || ( if [ \"$(arch)\" = \"aarch64\" ] ; then export F=\"aarch64-unknown-linux-gnu\"; else export F=\"x86_64-unknown-linux-gnu\"; fi && mkdir -p src-tauri/binaries && cp /usr/bin/ffmpeg src-tauri/binaries/ffm-$F && cp /usr/bin/ffprobe src-tauri/binaries/ffp-$F ) ) "
 	
 }

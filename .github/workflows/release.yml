@@ -8,6 +8,79 @@ env:
   temp_release: temp
 
 jobs:
+  linux-cli:
+    name: Build musl CLI
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/inkroomtemp/rust_musl_build:1.95.0
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache FFmpeg binaries
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            src-tauri/binaries
+          key: ffmpeg-musl-${{ runner.os }}
+      - name: Cache FFmpeg Linux Lib
+        id: lc
+        uses: actions/cache@v5
+        with:
+          path: ffmpeg-${{ runner.os }}
+          key: ffmpeg-lib-musl-${{ runner.os }}
+      - name: Build FFmpeg Linux
+        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          SKIP_DOCKER_BUILD: "1"
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: |
+          apt update -y
+          apt install -y nasm pkg-config ffmpeg bsdmainutils
+          git clone --depth 1 --branch "release/8.1" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          cd ffmpeg
+          ./configure \
+              --enable-cross-compile \
+              --cross-prefix=x86_64-unknown-linux-musl- \
+              --extra-cflags=-w \
+              --arch=x86_64 \
+              --prefix=$FFMPEG_DIR \
+              --target-os=linux \
+              --enable-static \
+              --disable-shared \
+              --disable-everything \
+              --disable-programs \
+              --enable-ffmpeg \
+              --enable-ffprobe \
+              --disable-avdevice \
+              --enable-avfilter \
+              --disable-swresample \
+              --disable-swscale \
+              --disable-network \
+              --disable-doc \
+              --disable-debug \
+              --enable-protocol=file,pipe,http \
+              --enable-demuxer=matroska,ass,srt \
+              --enable-muxer=matroska,ass,srt \
+              --enable-decoder=ass,ssa,subrip \
+              --enable-encoder=ass,ssa,subrip || cat ffbuild/config.log || false
+          make -j"$(nproc)" \
+          && make install
+          cd ../
+          sh src-tauri/ffmpeg/build-linux.sh x86_64-unknown-linux-musl
+          ls -all -h src-tauri/binaries
+          ls -all -h ffmpeg-Linux/lib
+      - name: Build CLI
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --target x86_64-unknown-linux-musl --bin mkv-cli
+      - name: Upload CLI
+        uses: actions/upload-artifact@v7
+        with:
+          name: mkv-cli
+          if-no-files-found: error
+          path: src-tauri/target/x86_64-unknown-linux-musl/release/mkv-cli
+
   linux:
     permissions:
       contents: write
@@ -92,11 +165,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
+          args: --features gui
           tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
+
+      - name: Build CLI
+        shell: bash
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin mkv-cli
 
       - name: Create portable ZIP
         shell: bash
@@ -228,11 +308,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
+          args: --features gui
           tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
+      - name: Build CLI
+        shell: pwsh
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin mkv-cli
       - name: Create portable ZIP
         shell: pwsh
         run: |
@@ -359,12 +445,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
+          args: --features gui
           tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.rust_target }}
+      - name: Build CLI
+        shell: bash
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin mkv-cli
       - name: Create portable macOS ZIP
         shell: bash
         run: |
@@ -383,7 +474,7 @@ jobs:
           path: protable/*.zip
 
   release:
-    needs: ["windows","linux","macos"]
+    needs: ["linux-cli", "windows", "linux", "macos"]
     permissions:
       contents: write
     
@@ -425,6 +516,7 @@ jobs:
               ```shell
               sudo xattr -rd com.apple.quarantine /Applications/mkv.app
               ```
+              **mkv-cli**是linux平台下的cli程序，适用于无GTK或者GTK版本不一致的环境，gui程序本身也具有cli功能
             EOF
             echo "" >> body.md
             echo "$msg" >> body.md
@@ -437,6 +529,11 @@ jobs:
           merge-multiple: true
           pattern: protable-*
           path: protable
+      - name: Download musl CLI
+        uses: actions/download-artifact@v8
+        with:
+          name: mkv-cli
+          path: mkv-cli
       - name: Delete Temp Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -450,6 +547,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          artifacts: "app/*,protable/*"
+          artifacts: "app/*,protable/*,mkv-cli/mkv-cli"
           bodyFile: "body.md"
           tag: ${{ steps.ready.outputs.tag }}
