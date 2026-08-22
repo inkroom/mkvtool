@@ -1,28 +1,36 @@
+use std::{env, fs, path::PathBuf, process::Command};
+
+#[cfg(feature = "gui")]
 use std::{
-    env,
-    fs::{self, File},
+    fs::File,
     io::{self, Cursor, Read},
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
 };
 
+#[cfg(feature = "gui")]
 const RELEASE_URL: &str = "https://github.com/inkroom/mkvtool/releases/download/resource/";
+#[cfg(feature = "gui")]
 const FFMPEG_SOURCE_URL: &str = "https://github.com/ffmpeg/ffmpeg";
+#[cfg(feature = "gui")]
 const FFMPEG_SOURCE_REF: &str = "release/8.1";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     inject_build_metadata();
-    if cfg!(target_os = "macos") {
-        build_macos_sidecars()
-            .unwrap_or_else(|error| panic!("无法编译 macOS FFmpeg sidecar：{error}"));
-    } else {
-        download_sidecars().unwrap_or_else(|error| panic!("无法准备 FFmpeg sidecar：{error}"));
+    #[cfg(feature = "gui")]
+    {
+        if cfg!(target_os = "macos") {
+            build_macos_sidecars()
+                .unwrap_or_else(|error| panic!("无法编译 macOS FFmpeg sidecar：{error}"));
+        } else {
+            download_sidecars().unwrap_or_else(|error| panic!("无法准备 FFmpeg sidecar：{error}"));
+        }
+        copy_resource().unwrap_or_else(|error| panic!("copy ffmpeg fail：{error}"));
+        tauri_build::build();
     }
-    copy_resource().unwrap_or_else(|error| panic!("copy ffmpeg fail：{error}"));
-    tauri_build::build();
 }
 
+#[cfg(feature = "gui")]
 fn copy_resource() -> Result<(), Box<dyn std::error::Error>> {
     // ffmpeg 作为资源文件 而非侧车进程的处理逻辑
     let target = env::var("TARGET")?;
@@ -74,6 +82,7 @@ fn command_output(command: &mut Command) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+#[cfg(feature = "gui")]
 fn build_macos_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     let target = env::var("TARGET")?;
     if !target.ends_with("-apple-darwin") {
@@ -161,6 +170,7 @@ fn build_macos_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     ensure_binaries_exist(&ffmpeg, &ffprobe)
 }
 
+#[cfg(feature = "gui")]
 fn run_command(command: &mut Command, action: &str) -> Result<(), Box<dyn std::error::Error>> {
     let status = command.status()?;
     if status.success() {
@@ -170,6 +180,7 @@ fn run_command(command: &mut Command, action: &str) -> Result<(), Box<dyn std::e
     }
 }
 
+#[cfg(feature = "gui")]
 fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     let target = env::var("TARGET")?;
     let extension = if target.contains("windows") {
@@ -206,6 +217,7 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "gui")]
 fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     let name = match target {
         "x86_64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linux64.zip",
@@ -217,6 +229,7 @@ fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>
     Ok(name)
 }
 
+#[cfg(feature = "gui")]
 fn extract_zip(
     archive: &[u8],
     ffmpeg: &Path,
@@ -234,6 +247,7 @@ fn extract_zip(
     ensure_binaries_exist(ffmpeg, ffprobe)
 }
 
+#[cfg(feature = "gui")]
 fn extract_tar_xz(
     archive: &[u8],
     ffmpeg: &Path,
@@ -253,6 +267,7 @@ fn extract_tar_xz(
     ensure_binaries_exist(ffmpeg, ffprobe)
 }
 
+#[cfg(feature = "gui")]
 fn executable_destination<'a>(path: &str, ffmpeg: &'a Path, ffprobe: &'a Path) -> Option<&'a Path> {
     let file_name = Path::new(path).file_name()?.to_str()?;
     match file_name {
@@ -262,12 +277,14 @@ fn executable_destination<'a>(path: &str, ffmpeg: &'a Path, ffprobe: &'a Path) -
     }
 }
 
+#[cfg(feature = "gui")]
 fn copy_entry(reader: &mut impl Read, destination: &Path) -> io::Result<()> {
     let mut output = File::create(destination)?;
     io::copy(reader, &mut output)?;
     Ok(())
 }
 
+#[cfg(feature = "gui")]
 fn ensure_binaries_exist(ffmpeg: &Path, ffprobe: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if ffmpeg.is_file() && ffprobe.is_file() {
         Ok(())
@@ -276,14 +293,14 @@ fn ensure_binaries_exist(ffmpeg: &Path, ffprobe: &Path) -> Result<(), Box<dyn st
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "gui", unix))]
 fn make_executable(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "gui", not(unix)))]
 fn make_executable(_: &Path) -> io::Result<()> {
     Ok(())
 }

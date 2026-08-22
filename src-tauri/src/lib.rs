@@ -14,36 +14,35 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
-use tauri_plugin_dialog::DialogExt;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MediaFile {
-    path: String,
-    name: String,
-    duration: Option<String>,
-    streams: Vec<MediaStream>,
+pub struct MediaFile {
+    pub path: String,
+    pub name: String,
+    pub duration: Option<String>,
+    pub streams: Vec<MediaStream>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MediaStream {
-    index: u32,
-    stream_type: MediaStreamType,
-    codec_name: Option<String>,
-    codec_description: Option<String>,
-    title: Option<String>,
-    filename: Option<String>,
-    language: Option<String>,
-    default_stream: bool,
-    forced: bool,
-    editable: bool,
-    subtitle: Option<SubtitleDocument>,
+pub struct MediaStream {
+    pub index: u32,
+    pub stream_type: MediaStreamType,
+    pub codec_name: Option<String>,
+    pub codec_description: Option<String>,
+    pub title: Option<String>,
+    pub filename: Option<String>,
+    pub language: Option<String>,
+    pub default_stream: bool,
+    pub forced: bool,
+    pub editable: bool,
+    pub subtitle: Option<SubtitleDocument>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum MediaStreamType {
+pub enum MediaStreamType {
     Video,
     Audio,
     Subtitle,
@@ -54,31 +53,32 @@ enum MediaStreamType {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SubtitleDocument {
-    content: String,
-    format: String,
-    codec_name: String,
+pub struct SubtitleDocument {
+    pub content: String,
+    pub format: String,
+    pub codec_name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SubtitleEdit {
-    stream_index: u32,
-    content: String,
-    format: Option<String>,
-    language: Option<String>,
-    title: Option<String>,
+pub struct SubtitleEdit {
+    pub stream_index: u32,
+    pub content: String,
+    pub format: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
     #[serde(default)]
-    new_stream: bool,
+    pub new_stream: bool,
 }
 
 const NEW_SUBTITLE_STREAM_INDEX: u32 = u32::MAX;
+const DEFAULT_ASS_FONT_SIZE: u32 = 26;
 
 #[derive(Debug, serde::Deserialize)]
-struct FontAttachment {
-    path: String,
+pub struct FontAttachment {
+    pub path: String,
     #[serde(skip)]
-    content: Option<Vec<u8>>,
+    pub content: Option<Vec<u8>>,
 }
 
 /// Parameters for the command-line subtitle conversion workflow.
@@ -92,6 +92,143 @@ pub struct CliSubtitleConversionOptions {
     pub font_size: u32,
     pub output: PathBuf,
     pub subset_fonts: bool,
+}
+
+pub enum CommandLineResult {
+    Help,
+    Version,
+    Converted(PathBuf),
+}
+
+pub fn command_line_help(program_name: &str) -> String {
+    format!(
+        r##"将 MKV 中指定的文本字幕转换为新的字幕流。
+
+用法：
+  {program_name} [选项] <输入文件>
+
+选项：
+  -s, --subtitle <索引>       要转换的字幕流索引；可重复，也可用逗号分隔
+  -f, --format <ass|srt>      新字幕格式（默认：ass）
+  -a, --attachment <文件>     添加字体附件；可重复
+      --font-name <名称>      转换为 ASS 时使用的字体名（默认：Arial）
+      --auto-font-name        从第一个字体附件中读取字体名并应用到ASS字幕中
+      --font-size <大小>      转换为 ASS 时使用的字体大小（默认：{DEFAULT_ASS_FONT_SIZE}）
+  -o, --output <文件>         输出 MKV 路径
+      --no-subset             不对字体附件进行子集化操作
+  -h, --help                  显示帮助
+  -v, --version               显示版本信息
+"##
+    )
+}
+
+pub fn command_line_version(package_version: &str, git_hash: &str, rust_version: &str) -> String {
+    format!("mkv {package_version}\ngit: {git_hash}\nrust: {rust_version}")
+}
+
+fn parse_command_line_indices(value: &str, indices: &mut Vec<u32>) -> Result<(), String> {
+    for index in value.split(',') {
+        let index = index.trim();
+        if index.is_empty() {
+            return Err("字幕流索引不能为空。".to_string());
+        }
+        indices.push(
+            index
+                .parse()
+                .map_err(|_| format!("无效的字幕流索引：{index}"))?,
+        );
+    }
+    Ok(())
+}
+
+fn command_line_value(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{option} 需要一个参数。"))
+}
+
+pub fn run_command_line(arguments: Vec<String>) -> Result<CommandLineResult, String> {
+    if arguments
+        .iter()
+        .any(|argument| argument == "-h" || argument == "--help")
+    {
+        return Ok(CommandLineResult::Help);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "-v" || argument == "--version")
+    {
+        return Ok(CommandLineResult::Version);
+    }
+
+    let (mut input, mut attachments, mut indices) = (None, Vec::new(), Vec::new());
+    let (mut format, mut font_name, mut font_size, mut output, mut subset, mut automatic) = (
+        "ass".to_string(),
+        None,
+        DEFAULT_ASS_FONT_SIZE,
+        None,
+        true,
+        false,
+    );
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-s" | "--subtitle" => parse_command_line_indices(
+                &command_line_value(&mut arguments, &argument)?,
+                &mut indices,
+            )?,
+            "-f" | "--format" => format = command_line_value(&mut arguments, &argument)?,
+            "-a" | "--attachment" => attachments.push(PathBuf::from(command_line_value(
+                &mut arguments,
+                &argument,
+            )?)),
+            "--font-name" => font_name = Some(command_line_value(&mut arguments, &argument)?),
+            "--auto-font-name" => automatic = true,
+            "--font-size" => {
+                let size = command_line_value(&mut arguments, &argument)?;
+                font_size = size
+                    .parse()
+                    .map_err(|_| format!("无效的字体大小：{size}"))?;
+            }
+            "-o" | "--output" => {
+                output = Some(PathBuf::from(command_line_value(
+                    &mut arguments,
+                    &argument,
+                )?))
+            }
+            "--no-subset" => subset = false,
+            _ if argument.starts_with('-') => return Err(format!("未知选项：{argument}")),
+            _ => {
+                if input.replace(PathBuf::from(argument)).is_some() {
+                    return Err("只能指定一个输入文件。".to_string());
+                }
+            }
+        }
+    }
+    let input = input.ok_or_else(|| "缺少输入文件。".to_string())?;
+    format = format.to_ascii_lowercase();
+    let output = output.unwrap_or_else(|| {
+        let stem = input
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output");
+        input.with_file_name(format!("{stem}-converted-{format}.mkv"))
+    });
+    convert_subtitle_streams_for_cli(CliSubtitleConversionOptions {
+        input,
+        attachments,
+        subtitle_stream_indices: indices,
+        target_format: format,
+        font_name,
+        automatic_font_name: automatic,
+        font_size,
+        output: output.clone(),
+        subset_fonts: subset,
+    })?;
+    Ok(CommandLineResult::Converted(output))
 }
 
 trait FfmpegService: Send + Sync {
@@ -1565,6 +1702,43 @@ pub fn convert_subtitle_streams_for_cli(
     )
 }
 
+pub fn inspect_mkv_path(path: &Path) -> Result<MediaFile, String> {
+    ActiveFfmpegService::new().inspect(path)
+}
+
+pub fn read_subtitle_path(path: &Path, stream_index: u32) -> Result<SubtitleDocument, String> {
+    ActiveFfmpegService::new().read_subtitle(path, stream_index)
+}
+
+pub fn save_subtitles_path(
+    input: &Path,
+    output: &Path,
+    edits: &[SubtitleEdit],
+    selected_stream_indices: &[u32],
+    default_subtitle_stream_index: Option<u32>,
+    mut font_attachments: Vec<FontAttachment>,
+    subset_fonts: bool,
+    subtitle_text: Option<String>,
+) -> Result<(), String> {
+    let service = ActiveFfmpegService::new();
+    prepare_font_attachments(
+        &service,
+        input,
+        edits,
+        &mut font_attachments,
+        subset_fonts,
+        subtitle_text,
+    )?;
+    service.remux_subtitles(
+        input,
+        output,
+        edits,
+        selected_stream_indices,
+        default_subtitle_stream_index,
+        &font_attachments,
+    )
+}
+
 #[allow(dead_code)]
 struct CliNewSubtitle {
     content: String,
@@ -2118,7 +2292,7 @@ impl CliFfmpegService {
         cmd.creation_flags(0x08000000);
         cmd
     }
-    
+
     #[cfg(not(target_os = "windows"))]
     fn ffmpeg_command(&self) -> Command {
         Command::new(&self.executable)
@@ -2758,6 +2932,12 @@ mod font {
         }
     }
 }
+
+pub fn read_font_name(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let name = font::dump(&data);
+    (!name.trim().is_empty()).then_some(name)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3152,159 +3332,4 @@ Input #0, matroska,webm, from 'sample.mkv':
             converted.contains("Dialogue: 0,0:00:01.23,0:00:02.45,Default,,0,0,0,,第一行\\N第二行")
         );
     }
-}
-
-fn mkv_path(path: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(path);
-    if !path.is_file() {
-        return Err("所选路径不是可读取的文件。".to_string());
-    }
-    if !path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("mkv"))
-    {
-        return Err("请选择 MKV 文件。".to_string());
-    }
-    Ok(path)
-}
-
-#[tauri::command]
-async fn inspect_mkv(_app: tauri::AppHandle, path: String) -> Result<MediaFile, String> {
-    let path = mkv_path(&path)?;
-    let service = ActiveFfmpegService::new();
-    tauri::async_runtime::spawn_blocking(move || service.inspect(&path))
-        .await
-        .map_err(|error| format!("处理媒体文件时出错：{error}"))?
-}
-
-#[tauri::command]
-async fn read_subtitle(
-    _app: tauri::AppHandle,
-    path: String,
-    stream_index: u32,
-) -> Result<SubtitleDocument, String> {
-    let path = mkv_path(&path)?;
-    let service = ActiveFfmpegService::new();
-    tauri::async_runtime::spawn_blocking(move || service.read_subtitle(&path, stream_index))
-        .await
-        .map_err(|error| format!("读取字幕时出错：{error}"))?
-}
-
-mod subtitle_commands {
-    #[tauri::command]
-    pub async fn convert_subtitle_format(
-        content: String,
-        source_format: String,
-        target_format: String,
-    ) -> Result<String, String> {
-        if source_format == target_format {
-            return Ok(content);
-        }
-        tauri::async_runtime::spawn_blocking(move || {
-            super::convert_subtitle_format(content, &source_format, &target_format)
-        })
-        .await
-        .map_err(|error| format!("转换字幕格式时出错：{error}"))?
-    }
-}
-
-#[tauri::command]
-async fn save_subtitles(
-    _app: tauri::AppHandle,
-    input_path: String,
-    output_path: String,
-    edits: Vec<SubtitleEdit>,
-    selected_stream_indices: Vec<u32>,
-    default_subtitle_stream_index: Option<u32>,
-    mut font_attachments: Vec<FontAttachment>,
-    subset_fonts: bool,
-    subtitle_text: Option<String>,
-) -> Result<(), String> {
-    let input = mkv_path(&input_path)?;
-    let output = PathBuf::from(output_path);
-    if output.as_os_str().is_empty()
-        || output.extension().and_then(|extension| extension.to_str()) != Some("mkv")
-    {
-        return Err("输出文件必须使用 .mkv 扩展名。".to_string());
-    }
-    let service = ActiveFfmpegService::new();
-    tauri::async_runtime::spawn_blocking(move || {
-        prepare_font_attachments(
-            &service,
-            &input,
-            &edits,
-            &mut font_attachments,
-            subset_fonts,
-            subtitle_text,
-        )?;
-        service.remux_subtitles(
-            &input,
-            &output,
-            &edits,
-            &selected_stream_indices,
-            default_subtitle_stream_index,
-            &font_attachments,
-        )
-    })
-    .await
-    .map_err(|error| format!("重新混流时出错：{error}"))?
-}
-
-#[tauri::command]
-async fn pick_mkv_file(app: tauri::AppHandle) -> Option<String> {
-    app.dialog()
-        .file()
-        .add_filter("Matroska 视频", &["mkv"])
-        .blocking_pick_file()
-        .and_then(|file| file.into_path().ok())
-        .map(|path| path.display().to_string())
-}
-
-#[tauri::command]
-async fn read_font_name(path: String) -> Option<String> {
-    let data = fs::read(path).ok()?;
-    let name = font::dump(&data);
-    (!name.trim().is_empty()).then_some(name)
-}
-
-#[tauri::command]
-async fn pick_font_file(app: tauri::AppHandle) -> Option<String> {
-    app.dialog()
-        .file()
-        .add_filter("字体文件", &["ttf", "otf", "ttc"])
-        .blocking_pick_file()
-        .and_then(|file| file.into_path().ok())
-        .map(|path| path.display().to_string())
-}
-
-#[tauri::command]
-async fn pick_output_file(app: tauri::AppHandle, suggested_name: String) -> Option<String> {
-    app.dialog()
-        .file()
-        .add_filter("Matroska 视频", &["mkv"])
-        .set_file_name(&suggested_name)
-        .blocking_save_file()
-        .and_then(|file| file.into_path().ok())
-        .map(|path| path.display().to_string())
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![
-            inspect_mkv,
-            read_subtitle,
-            subtitle_commands::convert_subtitle_format,
-            save_subtitles,
-            pick_mkv_file,
-            read_font_name,
-            pick_font_file,
-            pick_output_file
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
 }

@@ -14,22 +14,35 @@ edition = "2021"
 name = "mkv_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "mkv"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "mkv-cli"
+path = "src/cli.rs"
+
+[features]
+default = ["gui"]
+gui = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-opener", "dep:tauri-plugin-dialog", "dep:tauri-plugin-shell"]
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 tar = "0.4"
 ureq = "2.12"
 xz2 = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-shell = "2"
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-shell = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format"] }
-allsorts = { git = "https://github.com/yeslogic/allsorts", rev = "e69b42ebe46ec5d78e10b7ded3973cf1e43681a9" }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "static"] }
+allsorts = { version = "0.16.1" }
 encoding_rs = "0.8.35"
 [dev-dependencies]
 ureq = "2.12"

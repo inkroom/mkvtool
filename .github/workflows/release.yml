@@ -8,6 +8,79 @@ env:
   temp_release: temp
 
 jobs:
+  linux-cli:
+    name: Build musl CLI
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/inkroomtemp/rust_musl_build:1.95.0
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache FFmpeg binaries
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            src-tauri/binaries
+          key: ffmpeg-musl-${{ runner.os }}
+      - name: Cache FFmpeg Linux Lib
+        id: lc
+        uses: actions/cache@v5
+        with:
+          path: ffmpeg-${{ runner.os }}
+          key: ffmpeg-lib-musl-${{ runner.os }}
+      - name: Build FFmpeg Linux
+        if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          SKIP_DOCKER_BUILD: "1"
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: |
+          apt update -y
+          apt install -y nasm pkg-config ffmpeg bsdmainutils
+          git clone --depth 1 --branch "release/8.1" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          cd ffmpeg
+          ./configure \
+              --enable-cross-compile \
+              --cross-prefix=x86_64-unknown-linux-musl- \
+              --extra-cflags=-w \
+              --arch=x86_64 \
+              --prefix=$FFMPEG_DIR \
+              --target-os=linux \
+              --enable-static \
+              --disable-shared \
+              --disable-everything \
+              --disable-programs \
+              --enable-ffmpeg \
+              --enable-ffprobe \
+              --disable-avdevice \
+              --enable-avfilter \
+              --disable-swresample \
+              --disable-swscale \
+              --disable-network \
+              --disable-doc \
+              --disable-debug \
+              --enable-protocol=file,pipe,http \
+              --enable-demuxer=matroska,ass,srt \
+              --enable-muxer=matroska,ass,srt \
+              --enable-decoder=ass,ssa,subrip \
+              --enable-encoder=ass,ssa,subrip
+          make -j"$(nproc)" \
+          && make install
+          cd ../
+          sh src-tauri/ffmpeg/build-linux.sh x86_64-unknown-linux-musl
+          ls -all -h src-tauri/binaries
+          ls -all -h ffmpeg-Linux/lib
+      - name: Build CLI
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --target x86_64-unknown-linux-musl --bin mkv-cli
+      - name: Upload CLI
+        uses: actions/upload-artifact@v7
+        with:
+          name: mkv-cli
+          if-no-files-found: error
+          path: src-tauri/target/x86_64-unknown-linux-musl/release/mkv-cli
+
   linux:
     permissions:
       contents: write
@@ -92,11 +165,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
+          args: --features gui
           tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
+
+      - name: Build CLI
+        shell: bash
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin mkv-cli
 
       - name: Create portable ZIP
         shell: bash
@@ -163,13 +243,14 @@ jobs:
           $portfile = "custom-ports/ffmpeg/portfile.cmake"
           Get-Content $portfile
           $content = Get-Content $portfile
+          $content = $content.Replace("--disable-programs", "")
         
           # 寻找 vcpkg_configure_make 内部的 OPTIONS 数组结束前的括号，注入参数
           # 这里我们在 OPTIONS 的常见结构中寻找切入点，或者直接在追加到数组变量中
           # 一种稳妥的做法是定位到 vcpkg_configure_make( 并在其 OPTIONS 后面插入
           # 本处使用直接文本替换法，在 OPTIONS 关键字后插入自定义参数
           $target = 'message(STATUS "Building Options: ${OPTIONS}")'
-          $custom_options = "set(OPTIONS `"--toolchain=msvc --enable-static --disable-shared  --disable-everything --disable-programs --enable-ffmpeg --enable-ffprobe --disable-avdevice --enable-avfilter --disable-swresample --disable-swscale  --disable-network --disable-doc --disable-debug --enable-protocol=file,pipe,http --enable-demuxer=matroska,ass,srt --enable-muxer=matroska,ass,srt --enable-decoder=ass,ssa,subrip --enable-encoder=ass,ssa,subrip --target-os=win32 --enable-w32threads --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --disable-bzlib --disable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --disable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-schannel --disable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --disable-libtheora --disable-libvorbis --disable-libvpx --disable-vulkan --disable-libwebp --disable-libx264 --disable-libx265 --disable-libxml2 --disable-zlib --disable-libsrt --disable-libvpl --disable-vaapi --disable-libzmq --disable-librubberband --cc=`${CC_filename} --cxx=`${CXX_filename} --windres=`${RC_filename} --ld=`${LD_filename} --ar='ar-lib `${AR_filename}' --ranlib=: --extra-cflags=-DHAVE_UNISTD_H=0 --pkg-config=\`"`${PKGCONFIG}\`" --pkg-config-flags=--static`")"
+          $custom_options = "set(OPTIONS `"--toolchain=msvc --enable-static --disable-shared --disable-everything --enable-ffmpeg --enable-ffprobe --disable-avdevice --enable-avfilter --disable-swresample --disable-swscale --disable-network --disable-doc --disable-debug --enable-protocol=file,pipe,http --enable-demuxer=matroska,ass,srt --enable-muxer=matroska,ass,srt --enable-decoder=ass,ssa,subrip --enable-encoder=ass,ssa,subrip --target-os=win32 --enable-w32threads --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --disable-bzlib --disable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --disable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-schannel --disable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --disable-libtheora --disable-libvorbis --disable-libvpx --disable-vulkan --disable-libwebp --disable-libx264 --disable-libx265 --disable-libxml2 --disable-zlib --disable-libsrt --disable-libvpl --disable-vaapi --disable-libzmq --disable-librubberband --cc=`${CC_filename} --cxx=`${CXX_filename} --windres=`${RC_filename} --ld=`${LD_filename} --ar='ar-lib `${AR_filename}' --ranlib=: --extra-cflags=-DHAVE_UNISTD_H=0 --pkg-config=\`"`${PKGCONFIG}\`" --pkg-config-flags=--static`")"
           # 在目标字符串前面拼接自定义参数
           $replacement = $custom_options + "`n    " + $target
           
@@ -177,20 +258,35 @@ jobs:
           $new_content = $content.Replace($target, $replacement)
           
           Set-Content -Path $portfile -Value $new_content
+          if ((Get-Content -Raw $portfile) -match "--disable-programs") {
+            throw "自定义 FFmpeg port 仍禁用了可执行文件构建"
+          }
           
           # 打印修改后的文件片段用于验证 CI 日志
           Write-Host "--- Modified portfile.cmake (Preview) ---"
           Get-Content $portfile
-
-
           vcpkg install ffmpeg[core,avcodec,avformat]:x64-windows-static --overlay-ports=custom-ports --recurse
           ls C:/vcpkg/packages/ffmpeg_x64-windows-static/
           ls C:/vcpkg/packages/ffmpeg_x64-windows-static/lib
           $srcPath = "C:/vcpkg/packages/ffmpeg_x64-windows-static"
-          $ffmpeg = $srcPath + "/bin/ffmpeg.exe"
-          $ffprobe = $srcPath + "/bin/ffprobe.exe"
+          $buildPath = "C:/vcpkg/buildtrees/ffmpeg/x64-windows-static-rel"
+          Get-ChildItem -Path "C:/vcpkg/buildtrees/ffmpeg" -Recurse -File -Filter "config.mak" | ForEach-Object {
+            Write-Host "--- $($_.FullName) ---"
+            Select-String -Path $_.FullName -Pattern "CONFIG_FFMPEG|CONFIG_FFPROBE"
+          }
+          Get-ChildItem -Path $buildPath -File -Filter "ff*.exe"
+          $ffmpeg = Get-ChildItem -Path $buildPath -File -Filter "ffmpeg.exe" | Select-Object -First 1
+          $ffprobe = Get-ChildItem -Path $buildPath -File -Filter "ffprobe.exe" | Select-Object -First 1
+          if ($null -eq $ffmpeg -or $null -eq $ffprobe) {
+            throw "FFmpeg release build 未产出 ffmpeg.exe 或 ffprobe.exe"
+          }
+          $binariesPath = "${{ github.workspace }}/src-tauri/binaries"
+          New-Item -ItemType Directory -Force -Path $binariesPath | Out-Null
+          Copy-Item -Path $ffmpeg.FullName -Destination "$binariesPath/ffm-x86_64-pc-windows-msvc.exe" -Force
+          Copy-Item -Path $ffprobe.FullName -Destination "$binariesPath/ffp-x86_64-pc-windows-msvc.exe" -Force
           $destPath = "${{ github.workspace }}/ffmpeg-${{ runner.os }}"
           Copy-Item -Path $srcPath -Destination $destPath -Recurse -Force
+          Get-ChildItem -Path $binariesPath -File
           ls ${{ github.workspace }}/ffmpeg-${{ runner.os }}
       - name: Upload FFmpeg binaries
         uses: actions/upload-artifact@v7
@@ -228,11 +324,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
+          args: --features gui
           tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
+      - name: Build CLI
+        shell: pwsh
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin mkv-cli
       - name: Create portable ZIP
         shell: pwsh
         run: |
@@ -359,12 +461,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
         with:
+          args: --features gui
           tagName: "${{ env.temp_release }}" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "${{ env.temp_release }}"
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.rust_target }}
+      - name: Build CLI
+        shell: bash
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-${{ runner.os }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin mkv-cli
       - name: Create portable macOS ZIP
         shell: bash
         run: |
@@ -383,7 +490,7 @@ jobs:
           path: protable/*.zip
 
   release:
-    needs: ["windows","linux","macos"]
+    needs: ["linux-cli", "windows", "linux", "macos"]
     permissions:
       contents: write
     
@@ -425,6 +532,7 @@ jobs:
               ```shell
               sudo xattr -rd com.apple.quarantine /Applications/mkv.app
               ```
+              **mkv-cli**是linux平台下的cli程序，适用于无GTK或者GTK版本不一致的环境，gui程序本身也具有cli功能
             EOF
             echo "" >> body.md
             echo "$msg" >> body.md
@@ -437,6 +545,11 @@ jobs:
           merge-multiple: true
           pattern: protable-*
           path: protable
+      - name: Download musl CLI
+        uses: actions/download-artifact@v8
+        with:
+          name: mkv-cli
+          path: mkv-cli
       - name: Delete Temp Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -450,6 +563,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          artifacts: "app/*,protable/*"
+          artifacts: "app/*,protable/*,mkv-cli/mkv-cli"
           bodyFile: "body.md"
           tag: ${{ steps.ready.outputs.tag }}
