@@ -225,13 +225,13 @@ jobs:
         with:
           path: | 
             src-tauri/binaries
-          key: ffmpeg-${{ runner.os }}-http
+          key: ffmpeg-${{ runner.os }}
       - name: Cache FFmpeg Lib
         uses: actions/cache@v5
         id: lc
         with:
           path: ffmpeg-${{ runner.os }}
-          key: ffmpeg-lib-${{ runner.os }}-http
+          key: ffmpeg-lib-${{ runner.os }}
       - name: Build FFmpeg
         if: steps.cache.outputs.cache-hit != 'true' || steps.lc.outputs.cache-hit != 'true'
         env:

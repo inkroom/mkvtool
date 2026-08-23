@@ -1,3 +1,4 @@
+use flate2::read::ZlibDecoder;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -74,6 +75,34 @@ pub struct SubtitleEdit {
 const NEW_SUBTITLE_STREAM_INDEX: u32 = u32::MAX;
 const DEFAULT_ASS_FONT_SIZE: u32 = 26;
 static CLI_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+fn normalize_media_packet(
+    packet: ffmpeg_next::Packet,
+    medium: ffmpeg_next::media::Type,
+) -> Result<ffmpeg_next::Packet, String> {
+    let mut packet = packet;
+    if medium != ffmpeg_next::media::Type::Subtitle {
+        if let Some(data) = packet.data() {
+            if data.len() >= 2 && data[0] == 0x78 && matches!(data[1], 0x01 | 0x5e | 0x9c | 0xda) {
+                let mut decoder = ZlibDecoder::new(data);
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map_err(|error| format!("无法解压媒体数据：{error}"))?;
+                let mut unpacked = ffmpeg_next::Packet::copy(&decompressed);
+                unpacked.set_pts(packet.pts());
+                unpacked.set_dts(packet.dts());
+                unpacked.set_duration(packet.duration());
+                unpacked.set_flags(packet.flags());
+                packet = unpacked;
+            }
+        }
+    }
+    if medium == ffmpeg_next::media::Type::Audio {
+        packet.set_flags(packet.flags() | ffmpeg_next::packet::Flags::KEY);
+    }
+    Ok(packet)
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct FontAttachment {
@@ -1420,11 +1449,10 @@ impl FfmpegService for FFIFfmpegService {
                     }
                 }
             }
-            let context = ffmpeg_next::codec::context::Context::from_parameters(parameters)
-                .map_err(|error| format!("无法复制流参数：{error}"))?;
             let mut output_stream = output
-                .add_stream_with(&context)
+                .add_stream(ffmpeg_next::codec::encoder::find(parameters.id()))
                 .map_err(|error| format!("无法创建输出流：{error}"))?;
+            output_stream.set_parameters(parameters);
             output_stream.set_time_base(stream.time_base());
             let mut metadata = stream.metadata().to_owned();
             if let Some(language) = replacements
@@ -1503,46 +1531,6 @@ impl FfmpegService for FFIFfmpegService {
             .write_header()
             .map_err(|error| format!("无法写入 MKV 头：{error}"))?;
 
-        for (position, edit) in new_subtitles.iter().enumerate() {
-            let output_index = new_subtitle_output_indices[position];
-            let format = edit
-                .format
-                .as_deref()
-                .expect("validated new subtitle format");
-            let content = if format == "ass" {
-                Self::ass_document_parts(&edit.content)?.1
-            } else {
-                edit.content.as_str()
-            };
-            if format == "ass" {
-                for (dialogue, pts, duration) in
-                    Self::ass_packets(content, ffmpeg_next::Rational::new(1, 1_000))?
-                {
-                    let mut packet = ffmpeg_next::Packet::copy(dialogue.as_bytes());
-                    packet.set_stream(output_index);
-                    packet.set_pts(Some(pts));
-                    packet.set_dts(Some(pts));
-                    packet.set_duration(duration);
-                    packet
-                        .write(&mut output)
-                        .map_err(|error| format!("无法写入新 ASS 字幕：{error}"))?;
-                }
-            } else {
-                for (text, pts, duration) in
-                    Self::srt_packets(content, ffmpeg_next::Rational::new(1, 1_000))?
-                {
-                    let mut packet = ffmpeg_next::Packet::copy(text.as_bytes());
-                    packet.set_stream(output_index);
-                    packet.set_pts(Some(pts));
-                    packet.set_dts(Some(pts));
-                    packet.set_duration(duration);
-                    packet
-                        .write(&mut output)
-                        .map_err(|error| format!("无法写入新字幕：{error}"))?;
-                }
-            }
-        }
-
         let mut emitted_replacements = HashSet::new();
         let mut generated_dts = HashMap::new();
         let mut streams_without_dts = HashSet::new();
@@ -1594,14 +1582,19 @@ impl FfmpegService for FFIFfmpegService {
                 }
                 continue;
             }
-            let mut packet = packet;
-            if packet.dts().is_none() {
+            let mut packet = normalize_media_packet(packet, stream.parameters().medium())?;
+            if packet.dts().is_none()
+                && stream.parameters().medium() != ffmpeg_next::media::Type::Subtitle
+            {
                 streams_without_dts.insert(index);
             }
             if streams_without_dts.contains(&index) {
-                let next_dts = generated_dts
-                    .entry(index)
-                    .or_insert_with(|| packet.pts().unwrap_or_default());
+                let next_dts = generated_dts.entry(index).or_insert_with(|| {
+                    packet
+                        .pts()
+                        .unwrap_or_default()
+                        .saturating_sub(packet.duration().max(1).saturating_mul(2))
+                });
                 packet.set_dts(Some(*next_dts));
                 if packet.pts().unwrap_or_default() < *next_dts {
                     packet.set_pts(Some(*next_dts));
@@ -1610,9 +1603,50 @@ impl FfmpegService for FFIFfmpegService {
             }
             packet.set_stream(output_index);
             packet
-                .write(&mut output)
+                .write_interleaved(&mut output)
                 .map_err(|error| format!("无法写入媒体数据：{error}"))?;
         }
+
+        for (position, edit) in new_subtitles.iter().enumerate() {
+            let output_index = new_subtitle_output_indices[position];
+            let format = edit
+                .format
+                .as_deref()
+                .expect("validated new subtitle format");
+            let content = if format == "ass" {
+                Self::ass_document_parts(&edit.content)?.1
+            } else {
+                edit.content.as_str()
+            };
+            if format == "ass" {
+                for (dialogue, pts, duration) in
+                    Self::ass_packets(content, ffmpeg_next::Rational::new(1, 1_000))?
+                {
+                    let mut packet = ffmpeg_next::Packet::copy(dialogue.as_bytes());
+                    packet.set_stream(output_index);
+                    packet.set_pts(Some(pts));
+                    packet.set_dts(Some(pts));
+                    packet.set_duration(duration);
+                    packet
+                        .write(&mut output)
+                        .map_err(|error| format!("无法写入新 ASS 字幕：{error}"))?;
+                }
+            } else {
+                for (text, pts, duration) in
+                    Self::srt_packets(content, ffmpeg_next::Rational::new(1, 1_000))?
+                {
+                    let mut packet = ffmpeg_next::Packet::copy(text.as_bytes());
+                    packet.set_stream(output_index);
+                    packet.set_pts(Some(pts));
+                    packet.set_dts(Some(pts));
+                    packet.set_duration(duration);
+                    packet
+                        .write(&mut output)
+                        .map_err(|error| format!("无法写入新字幕：{error}"))?;
+                }
+            }
+        }
+
         output
             .write_trailer()
             .map_err(|error| format!("无法完成 MKV 写入：{error}"))
@@ -1918,242 +1952,6 @@ fn add_cli_subtitle_stream(
         }
     }
     Ok(stream.index())
-}
-
-/// Converts selected subtitle streams and writes them before the input's original subtitle streams.
-/// This intentionally always uses the linked FFmpeg implementation so the command works without an
-/// `ffmpeg` executable beside the application.
-#[allow(dead_code)]
-fn convert_subtitle_streams_for_cli_ffi_legacy(
-    options: CliSubtitleConversionOptions,
-) -> Result<(), String> {
-    FFIFfmpegService::initialize()?;
-    if options.input == options.output {
-        return Err("输出文件不能覆盖输入文件。".to_string());
-    }
-    if !options
-        .output
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("mkv"))
-    {
-        return Err("输出文件必须使用 .mkv 扩展名。".to_string());
-    }
-    let target_format = options.target_format.to_ascii_lowercase();
-    if subtitle_codec_id(&target_format).is_none() {
-        return Err("字幕格式只能是 ass 或 srt。".to_string());
-    }
-    if options.subtitle_stream_indices.is_empty() {
-        return Err("请至少指定一个字幕流索引。".to_string());
-    }
-    if options.font_size == 0 {
-        return Err("字体大小必须大于 0。".to_string());
-    }
-    let ass_font_name = options.font_name.as_deref().unwrap_or("Arial");
-    if ass_font_name.trim().is_empty() || ass_font_name.contains([',', '\r', '\n']) {
-        return Err("ASS 字体名不能为空，且不能包含逗号或换行。".to_string());
-    }
-
-    let mut reader = ffmpeg_next::format::input(&options.input)
-        .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-    let requested = options
-        .subtitle_stream_indices
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let mut selected = reader
-        .streams()
-        .filter(|stream| requested.contains(&(stream.index() as u32)))
-        .map(|stream| stream.index() as u32)
-        .collect::<Vec<_>>();
-    if selected.len() != requested.len() {
-        return Err("未找到所选字幕流。".to_string());
-    }
-    selected.sort_unstable();
-    for index in &selected {
-        let stream = reader
-            .streams()
-            .find(|stream| stream.index() == *index as usize)
-            .expect("selected stream exists");
-        if stream.parameters().medium() != ffmpeg_next::media::Type::Subtitle
-            || subtitle_specification(stream.parameters().id().name()).is_none()
-        {
-            return Err(format!("流 #{index} 不是可转换的文本字幕流。"));
-        }
-    }
-    let documents = FFIFfmpegService::read_subtitles(&mut reader, &selected)?;
-
-    let metadata_input = ffmpeg_next::format::input(&options.input)
-        .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-    let mut new_subtitles = Vec::with_capacity(selected.len());
-    for index in &selected {
-        let document = documents.get(index).expect("selected subtitle was read");
-        let content = match (document.format.as_str(), target_format.as_str()) {
-            (source, target) if source == target => document.content.clone(),
-            ("ass", "srt") => FFIFfmpegService::ass_to_srt(&document.content)?,
-            ("srt", "ass") => FFIFfmpegService::srt_to_ass_with_style(
-                &document.content,
-                ass_font_name,
-                options.font_size,
-            )?,
-            (source, _) => return Err(format!("不支持将 {source} 字幕转换为 {target_format}。")),
-        };
-        let stream = metadata_input
-            .streams()
-            .find(|stream| stream.index() == *index as usize)
-            .expect("selected stream exists");
-        let metadata = stream.metadata();
-        new_subtitles.push(CliNewSubtitle {
-            content,
-            format: target_format.clone(),
-            language: metadata.get("language").unwrap_or("und").to_string(),
-            title: metadata.get("title").unwrap_or("").to_string(),
-        });
-    }
-    drop(metadata_input);
-
-    let mut fonts = options
-        .attachments
-        .into_iter()
-        .map(|path| FontAttachment {
-            path: path.display().to_string(),
-            content: None,
-        })
-        .collect::<Vec<_>>();
-    if options.subset_fonts {
-        let text = new_subtitles
-            .iter()
-            .map(|subtitle| subtitle.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        for font in &mut fonts {
-            font.content = Some(
-                font::subset_text_from_path(&font.path, &text)
-                    .ok_or_else(|| format!("无法子集化字体文件 {}。", font.path))?,
-            );
-        }
-    }
-
-    let mut input = ffmpeg_next::format::input(&options.input)
-        .map_err(|error| format!("无法读取媒体文件：{error}"))?;
-    let mut output = ffmpeg_next::format::output(&options.output)
-        .map_err(|error| format!("无法创建输出文件：{error}"))?;
-    output.set_metadata(input.metadata().to_owned());
-    let mut output_indices = HashMap::new();
-    let mut new_output_indices = Vec::with_capacity(new_subtitles.len());
-    let mut inserted_new_subtitles = false;
-    for stream in input.streams() {
-        if !inserted_new_subtitles
-            && stream.parameters().medium() == ffmpeg_next::media::Type::Subtitle
-        {
-            for (position, subtitle) in new_subtitles.iter().enumerate() {
-                new_output_indices.push(add_cli_subtitle_stream(
-                    &mut output,
-                    subtitle,
-                    position == 0,
-                )?);
-            }
-            inserted_new_subtitles = true;
-        }
-        let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|error| format!("无法复制流参数：{error}"))?;
-        let mut output_stream = output
-            .add_stream_with(&context)
-            .map_err(|error| format!("无法创建输出流：{error}"))?;
-        output_stream.set_time_base(stream.time_base());
-        output_stream.set_metadata(stream.metadata().to_owned());
-        if stream.parameters().medium() == ffmpeg_next::media::Type::Subtitle {
-            unsafe {
-                (*output_stream.as_mut_ptr()).disposition &=
-                    !ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT;
-            }
-        }
-        output_indices.insert(stream.index(), output_stream.index());
-    }
-    if !inserted_new_subtitles {
-        for (position, subtitle) in new_subtitles.iter().enumerate() {
-            new_output_indices.push(add_cli_subtitle_stream(
-                &mut output,
-                subtitle,
-                position == 0,
-            )?);
-        }
-    }
-    for font in &fonts {
-        let (filename, mime_type, content) = font_attachment_data(font)?;
-        let mut parameters = ffmpeg_next::codec::Parameters::new();
-        unsafe {
-            let parameters = &mut *parameters.as_mut_ptr();
-            parameters.codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_ATTACHMENT;
-            parameters.codec_id = if mime_type == "application/vnd.ms-opentype" {
-                ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_OTF
-            } else {
-                ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_TTF
-            };
-            parameters.extradata_size = content.len() as i32;
-            parameters.extradata = ffmpeg_next::ffi::av_mallocz(
-                content.len() + ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
-            ) as *mut u8;
-            if parameters.extradata.is_null() {
-                return Err("无法为字体附件分配内存。".to_string());
-            }
-            std::ptr::copy_nonoverlapping(content.as_ptr(), parameters.extradata, content.len());
-        }
-        let mut attachment = output
-            .add_stream_with(
-                &ffmpeg_next::codec::context::Context::from_parameters(parameters)
-                    .map_err(|error| format!("无法创建字体附件流：{error}"))?,
-            )
-            .map_err(|error| format!("无法创建字体附件流：{error}"))?;
-        let mut metadata = ffmpeg_next::Dictionary::new();
-        metadata.set("filename", &filename);
-        metadata.set("mimetype", mime_type);
-        attachment.set_metadata(metadata);
-    }
-    output
-        .write_header()
-        .map_err(|error| format!("无法写入 MKV 头：{error}"))?;
-    for (subtitle, output_index) in new_subtitles.iter().zip(new_output_indices) {
-        if subtitle.format == "ass" {
-            let (_, dialogues) = FFIFfmpegService::ass_document_parts(&subtitle.content)?;
-            for (dialogue, pts, duration) in
-                FFIFfmpegService::ass_packets(dialogues, ffmpeg_next::Rational::new(1, 1_000))?
-            {
-                let mut packet = ffmpeg_next::Packet::copy(dialogue.as_bytes());
-                packet.set_stream(output_index);
-                packet.set_pts(Some(pts));
-                packet.set_dts(Some(pts));
-                packet.set_duration(duration);
-                packet
-                    .write_interleaved(&mut output)
-                    .map_err(|error| format!("无法写入新 ASS 字幕：{error}"))?;
-            }
-        } else {
-            for (text, pts, duration) in FFIFfmpegService::srt_packets(
-                &subtitle.content,
-                ffmpeg_next::Rational::new(1, 1_000),
-            )? {
-                let mut packet = ffmpeg_next::Packet::copy(text.as_bytes());
-                packet.set_stream(output_index);
-                packet.set_pts(Some(pts));
-                packet.set_dts(Some(pts));
-                packet.set_duration(duration);
-                packet
-                    .write_interleaved(&mut output)
-                    .map_err(|error| format!("无法写入新 SRT 字幕：{error}"))?;
-            }
-        }
-    }
-    for (stream, mut packet) in input.packets() {
-        if let Some(&output_index) = output_indices.get(&stream.index()) {
-            packet.set_stream(output_index);
-            packet
-                .write_interleaved(&mut output)
-                .map_err(|error| format!("无法写入媒体数据：{error}"))?;
-        }
-    }
-    output
-        .write_trailer()
-        .map_err(|error| format!("无法完成 MKV 写入：{error}"))
 }
 
 struct CliFfmpegService {
@@ -3078,9 +2876,11 @@ pub fn read_font_name(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
     use std::{
         error::Error,
         fs::{self, File},
+        io::Write,
         sync::{Mutex, MutexGuard, OnceLock},
     };
 
@@ -3092,6 +2892,33 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn normalizes_zlib_media_packets_and_audio_key_flags() {
+        let payload = b"0000001eh264-packet";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).expect("zlib 应能写入测试包");
+        let compressed = encoder.finish().expect("zlib 应能完成测试包");
+
+        let mut video = ffmpeg_next::Packet::copy(&compressed);
+        video.set_pts(Some(42));
+        video.set_dts(Some(1));
+        video.set_duration(41);
+        video.set_flags(ffmpeg_next::packet::Flags::KEY);
+        let video =
+            normalize_media_packet(video, ffmpeg_next::media::Type::Video).expect("视频包应能解压");
+        assert_eq!(video.data(), Some(payload.as_slice()));
+        assert_eq!(video.pts(), Some(42));
+        assert_eq!(video.dts(), Some(1));
+        assert_eq!(video.duration(), 41);
+        assert!(video.is_key());
+
+        let mut audio = ffmpeg_next::Packet::copy(payload);
+        audio.set_flags(ffmpeg_next::packet::Flags::empty());
+        let audio = normalize_media_packet(audio, ffmpeg_next::media::Type::Audio)
+            .expect("音频包应能规范化");
+        assert!(audio.is_key(), "音频包必须带有可随机访问标志");
     }
 
     fn test_target_dir() -> Result<PathBuf, Box<dyn Error>> {
@@ -3113,7 +2940,7 @@ mod tests {
         fs::create_dir_all(&fixture_dir)?;
         let temporary = fixture.with_extension(format!("mkv-{}", std::process::id()));
         let response = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(600))
             .build()
             .get(format!("{}{}", TEST_MKV_URL, mkv).as_str())
             .call()?;
@@ -3256,6 +3083,81 @@ mod tests {
             let input = download_test_mkv(mkv).expect("测试文件应下载到 target 目录");
             assert_reads_subtitle_from_downloaded_test_file(&input);
         }
+    }
+
+    #[test]
+    fn converts_zib_fixture_like_cli_command() {
+        let _lock = ffmpeg_test_lock();
+        let input = download_test_mkv("zib.mkv").expect("应能下载测试文件");
+        let font = download_test_mkv("BlackSugarPlumCandy-Bold.ttf").expect("应能下载测试文件");
+        let output = test_target_dir()
+            .expect("应能定位 Cargo target 目录")
+            .join("ffmpeg-test-fixtures")
+            .join("zib-converted.mkv");
+
+        convert_subtitle_streams_for_cli(CliSubtitleConversionOptions {
+            input: input.clone(),
+            attachments: vec![font],
+            subtitle_stream_indices: vec![2],
+            default_index: Some(2),
+            target_format: "ass".to_string(),
+            font_name: None,
+            automatic_font_name: true,
+            font_size: 26,
+            output: output.clone(),
+            subset_fonts: true,
+        })
+        .expect("CLI 字幕转换应成功");
+
+        let service = FFIFfmpegService::new();
+        let input_media = service.inspect(&input).expect("应能探测 zib.mkv");
+        let output_media = service.inspect(&output).expect("应能探测转换结果");
+        assert_eq!(output_media.duration, input_media.duration);
+        assert!(output_media
+            .streams
+            .iter()
+            .any(|stream| stream.codec_name.as_deref() == Some("ass")));
+        assert!(output_media
+            .streams
+            .iter()
+            .any(|stream| stream.stream_type == MediaStreamType::Attachment));
+
+        let mut input_context = ffmpeg_next::format::input(&input).expect("应能读取 zib.mkv");
+        let (input_stream, input_packet) = input_context
+            .packets()
+            .find(|(stream, packet)| {
+                stream.parameters().medium() == ffmpeg_next::media::Type::Video && packet.is_key()
+            })
+            .expect("输入应包含关键视频包");
+        let input_packet = normalize_media_packet(input_packet, input_stream.parameters().medium())
+            .expect("输入视频包应能规范化");
+        let mut output_context = ffmpeg_next::format::input(&output).expect("应能读取输出文件");
+        let (output_stream, output_packet) = output_context
+            .packets()
+            .find(|(stream, packet)| {
+                stream.parameters().medium() == ffmpeg_next::media::Type::Video && packet.is_key()
+            })
+            .expect("输出应包含关键视频包");
+        let output_codec_id = output_stream.parameters().id();
+        let output_packet_data = output_packet.data().map(ToOwned::to_owned);
+        let output_packet_pts = output_packet.pts();
+        let output_packet_is_uncompressed = !output_packet.data().is_some_and(|data| {
+            data.starts_with(&[0x78, 0x01])
+                || data.starts_with(&[0x78, 0x5e])
+                || data.starts_with(&[0x78, 0x9c])
+                || data.starts_with(&[0x78, 0xda])
+        });
+        let input_codec_id = input_stream.parameters().id();
+        assert_eq!(output_packet_data.as_deref(), input_packet.data());
+        assert_eq!(output_packet_pts, input_packet.pts());
+        assert!(output_packet_is_uncompressed);
+
+        let (_, audio_packet) = output_context
+            .packets()
+            .find(|(stream, _)| stream.parameters().medium() == ffmpeg_next::media::Type::Audio)
+            .expect("输出应包含音频包");
+        assert!(audio_packet.is_key(), "输出音频包应带有 KEY 标志");
+        assert_eq!(output_codec_id, input_codec_id);
     }
 
     #[test]
