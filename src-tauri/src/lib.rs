@@ -73,6 +73,7 @@ pub struct SubtitleEdit {
 
 const NEW_SUBTITLE_STREAM_INDEX: u32 = u32::MAX;
 const DEFAULT_ASS_FONT_SIZE: u32 = 26;
+static CLI_VERBOSE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, serde::Deserialize)]
 pub struct FontAttachment {
@@ -120,7 +121,8 @@ subtitle 选项：
       --font-size <大小>      转换为 ASS 时使用的字体大小（默认：{DEFAULT_ASS_FONT_SIZE}）
   -o, --output <文件>         输出 MKV 路径
       --no-subset             不对字体附件进行子集化操作
-  -h, --help                  显示帮助
+  -vv                        输出 FFmpeg 详细日志
+  -h, --help                 显示帮助
   -v, --version               显示版本信息
 "##
     )
@@ -128,6 +130,32 @@ subtitle 选项：
 
 pub fn command_line_version(package_version: &str, git_hash: &str, rust_version: &str) -> String {
     format!("mkv {package_version}\ngit: {git_hash}\nrust: {rust_version}")
+}
+
+pub fn print_command_line_result(
+    result: CommandLineResult,
+    program_name: &str,
+    package_version: &str,
+    git_hash: &str,
+    rust_version: &str,
+) {
+    match result {
+        CommandLineResult::Help => print!("{}", command_line_help(program_name)),
+        CommandLineResult::Version => println!(
+            "{}",
+            command_line_version(package_version, git_hash, rust_version)
+        ),
+        CommandLineResult::Converted(output) => eprintln!("已创建：{}", output.display()),
+        CommandLineResult::Inspected(media) => println!(
+            "{}",
+            serde_json::to_string_pretty(&media).expect("媒体信息应能序列化")
+        ),
+    }
+}
+
+pub fn print_command_line_error(error: &str, program_name: &str) -> ! {
+    eprintln!("错误：{error}\n\n{}", command_line_help(program_name));
+    std::process::exit(2);
 }
 
 fn parse_command_line_indices(value: &str, indices: &mut Vec<u32>) -> Result<(), String> {
@@ -155,6 +183,18 @@ fn command_line_value(
 }
 
 pub fn run_command_line(arguments: Vec<String>) -> Result<CommandLineResult, String> {
+    let verbose = arguments.iter().any(|argument| argument == "-vv");
+    CLI_VERBOSE.store(verbose, Ordering::Relaxed);
+    ffmpeg_next::util::log::set_level(if verbose {
+        ffmpeg_next::util::log::Level::Verbose
+    } else {
+        ffmpeg_next::util::log::Level::Quiet
+    });
+
+    let arguments = arguments
+        .into_iter()
+        .filter(|argument| argument != "-vv")
+        .collect::<Vec<_>>();
     if arguments
         .iter()
         .any(|argument| argument == "-h" || argument == "--help")
@@ -1484,7 +1524,7 @@ impl FfmpegService for FFIFfmpegService {
                     packet.set_dts(Some(pts));
                     packet.set_duration(duration);
                     packet
-                        .write_interleaved(&mut output)
+                        .write(&mut output)
                         .map_err(|error| format!("无法写入新 ASS 字幕：{error}"))?;
                 }
             } else {
@@ -1497,13 +1537,15 @@ impl FfmpegService for FFIFfmpegService {
                     packet.set_dts(Some(pts));
                     packet.set_duration(duration);
                     packet
-                        .write_interleaved(&mut output)
+                        .write(&mut output)
                         .map_err(|error| format!("无法写入新字幕：{error}"))?;
                 }
             }
         }
 
         let mut emitted_replacements = HashSet::new();
+        let mut generated_dts = HashMap::new();
+        let mut streams_without_dts = HashSet::new();
         for (stream, packet) in input.packets() {
             let index = stream.index();
             let Some(&output_index) = output_indices.get(&index) else {
@@ -1533,7 +1575,7 @@ impl FfmpegService for FFIFfmpegService {
                             replacement.set_dts(Some(pts));
                             replacement.set_duration(duration);
                             replacement
-                                .write_interleaved(&mut output)
+                                .write(&mut output)
                                 .map_err(|error| format!("无法写入编辑后的 ASS 字幕：{error}"))?;
                         }
                     } else {
@@ -1545,7 +1587,7 @@ impl FfmpegService for FFIFfmpegService {
                             replacement.set_dts(Some(pts));
                             replacement.set_duration(duration);
                             replacement
-                                .write_interleaved(&mut output)
+                                .write(&mut output)
                                 .map_err(|error| format!("无法写入编辑后的字幕：{error}"))?;
                         }
                     }
@@ -1553,9 +1595,22 @@ impl FfmpegService for FFIFfmpegService {
                 continue;
             }
             let mut packet = packet;
+            if packet.dts().is_none() {
+                streams_without_dts.insert(index);
+            }
+            if streams_without_dts.contains(&index) {
+                let next_dts = generated_dts
+                    .entry(index)
+                    .or_insert_with(|| packet.pts().unwrap_or_default());
+                packet.set_dts(Some(*next_dts));
+                if packet.pts().unwrap_or_default() < *next_dts {
+                    packet.set_pts(Some(*next_dts));
+                }
+                *next_dts = next_dts.saturating_add(packet.duration().max(1));
+            }
             packet.set_stream(output_index);
             packet
-                .write_interleaved(&mut output)
+                .write(&mut output)
                 .map_err(|error| format!("无法写入媒体数据：{error}"))?;
         }
         output
@@ -1592,6 +1647,45 @@ fn convert_subtitle_format_with_ass_style(
         (source, target) if source == target => Ok(content),
         ("srt", "ass") => FFIFfmpegService::srt_to_ass_with_style(&content, font_name, font_size),
         _ => convert_subtitle_format(content, source_format, target_format),
+    }
+}
+
+fn print_input_subtitle_streams(media: &MediaFile) {
+    eprintln!("输入文件：{}", media.path);
+    let subtitles = media
+        .streams
+        .iter()
+        .filter(|stream| stream.stream_type == MediaStreamType::Subtitle)
+        .collect::<Vec<_>>();
+    if subtitles.is_empty() {
+        eprintln!("已有字幕流：无");
+        return;
+    }
+
+    eprintln!("已有字幕流：");
+    for stream in subtitles {
+        let language = stream.language.as_deref().unwrap_or("und");
+        let title = stream.title.as_deref().unwrap_or("");
+        let mut flags = Vec::new();
+        if stream.default_stream {
+            flags.push("默认");
+        }
+        if stream.forced {
+            flags.push("强制");
+        }
+        eprintln!(
+            "  #{} {} lang={}{}{}{}",
+            stream.index,
+            stream.codec_name.as_deref().unwrap_or("unknown"),
+            language,
+            if title.is_empty() { "" } else { " title=" },
+            title,
+            if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", flags.join(", "))
+            },
+        );
     }
 }
 
@@ -1654,6 +1748,7 @@ pub fn convert_subtitle_streams_for_cli(
         .copied()
         .collect::<HashSet<_>>();
     let media = service.inspect(&options.input)?;
+    print_input_subtitle_streams(&media);
     let selected = media
         .streams
         .iter()
@@ -2179,6 +2274,12 @@ struct Disposition {
 use std::process::{Command, Stdio};
 
 impl CliFfmpegService {
+    fn emit_verbose_log(stderr: &[u8]) {
+        if CLI_VERBOSE.load(Ordering::Relaxed) && !stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(stderr));
+        }
+    }
+
     fn detect() -> Option<Self> {
         let executable_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
         ["ffmpeg", "ffmpeg.exe"]
@@ -2349,6 +2450,7 @@ impl CliFfmpegService {
 
         // `ffmpeg -i` prints the input metadata then exits unsuccessfully because it has no output.
         // A successfully parsed input description is therefore the success condition for probing.
+        Self::emit_verbose_log(&output.stderr);
         if let Some(probe) = self.parse_ffmpeg_probe_output(&output.stderr) {
             return Ok(probe);
         }
@@ -2697,6 +2799,7 @@ impl FfmpegService for CliFfmpegService {
         }
         let output_result = output_result
             .map_err(|error| format!("无法启动 ffmpeg，请确认已安装 FFmpeg：{error}"))?;
+        Self::emit_verbose_log(&output_result.stderr);
 
         if !output_result.status.success() {
             return Err(self.command_error("ffmpeg", &output_result.stderr));
