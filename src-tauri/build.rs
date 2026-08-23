@@ -16,7 +16,8 @@ const FFMPEG_SOURCE_REF: &str = "release/8.1";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    if cfg!(target_os = "windows") {
+    #[cfg(windows)]
+    {
         println!("cargo:rustc-link-lib=ncrypt"); // 修复 NCryptOpenStorageProvider
         println!("cargo:rustc-link-lib=crypt32");
         println!("cargo:rustc-link-lib=gdi32");
@@ -166,7 +167,7 @@ fn build_macos_sidecars() -> Result<(), Box<dyn std::error::Error>> {
                 "--enable-protocol=file,pipe",
                 "--enable-demuxer=matroska,ass,srt",
                 "--enable-muxer=matroska,ass,srt",
-                "--enable-decoder=ass,ssa,subrip",
+                "--enable-decoder=h264,aac,ass,ssa,subrip",
                 "--enable-encoder=ass,ssa,subrip",
             ]),
         "配置 FFmpeg",

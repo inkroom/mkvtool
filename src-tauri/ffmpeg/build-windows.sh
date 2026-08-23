@@ -6,7 +6,7 @@ src_tauri_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
 FFMPEG_REF="8.1"
 # 修改构建参数
-FF_CONFIGURE="--toolchain=msvc --enable-static --disable-shared  --disable-everything --disable-programs --enable-ffmpeg --enable-ffprobe --disable-avdevice --enable-avfilter --disable-swresample --disable-swscale  --disable-network --disable-doc --disable-debug --enable-protocol=file,pipe --enable-demuxer=matroska,ass,srt --enable-muxer=matroska,ass,srt --enable-decoder=ass,ssa,subrip --enable-encoder=ass,ssa,subrip"
+FF_CONFIGURE="--toolchain=msvc --enable-static --disable-shared  --disable-everything --disable-programs --enable-ffmpeg --enable-ffprobe --disable-avdevice --enable-avfilter --disable-swresample --disable-swscale  --disable-network --disable-doc --disable-debug --enable-protocol=file,pipe --enable-demuxer=matroska,ass,srt --enable-muxer=matroska,ass,srt --enable-decoder=h264,aac,ass,ssa,subrip --enable-encoder=ass,ssa,subrip"
 cat <<EOF > Dockerfile.tmp
     FROM ghcr.io/btbn/ffmpeg-builds/$FFMPEG_ARCH-lgpl-$FFMPEG_REF
     ENV FF_CONFIGURE="$FF_CONFIGURE"

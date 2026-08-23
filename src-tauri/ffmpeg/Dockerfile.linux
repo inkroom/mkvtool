@@ -49,7 +49,7 @@ RUN case "${TARGETARCH}" in \
         --enable-protocol=file,pipe,http,tcp \
         --enable-demuxer=matroska,ass,srt \
         --enable-muxer=matroska,ass,srt \
-        --enable-decoder=ass,ssa,subrip \
+        --enable-decoder=aac,ass,ssa,subrip \
         --enable-encoder=ass,ssa,subrip \
     && make -j"$(nproc)" \
     && make install
