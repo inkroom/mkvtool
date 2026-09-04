@@ -1,18 +1,13 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
-#[cfg(feature = "gui")]
 use std::{
     fs::File,
     io::{self, Cursor, Read},
     path::Path,
 };
 
-#[cfg(feature = "gui")]
 const RELEASE_URL: &str = "https://github.com/inkroom/mkvtool/releases/download/resource/";
-#[cfg(feature = "gui")]
-const FFMPEG_SOURCE_URL: &str = "https://github.com/ffmpeg/ffmpeg";
-#[cfg(feature = "gui")]
-const FFMPEG_SOURCE_REF: &str = "release/8.1";
+
 #[cfg(all(windows, not(feature = "gui")))]
 fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -94,20 +89,16 @@ fn main() {
     #[cfg(all(windows, not(feature = "gui")))]
     embed_windows_icon().expect("嵌入logo失败");
     inject_build_metadata();
+    if cfg!(not(target_os = "macos")) {
+        download_sidecars().unwrap_or_else(|error| panic!("无法准备 FFmpeg sidecar：{error}"));
+    }
+    copy_resource().unwrap_or_else(|error| panic!("copy ffmpeg fail：{error}"));
     #[cfg(feature = "gui")]
     {
-        if cfg!(target_os = "macos") {
-            build_macos_sidecars()
-                .unwrap_or_else(|error| panic!("无法编译 macOS FFmpeg sidecar：{error}"));
-        } else {
-            download_sidecars().unwrap_or_else(|error| panic!("无法准备 FFmpeg sidecar：{error}"));
-        }
-        copy_resource().unwrap_or_else(|error| panic!("copy ffmpeg fail：{error}"));
         tauri_build::build();
     }
 }
 
-#[cfg(feature = "gui")]
 fn copy_resource() -> Result<(), Box<dyn std::error::Error>> {
     // ffmpeg 作为资源文件 而非侧车进程的处理逻辑
     let target = env::var("TARGET")?;
@@ -118,7 +109,14 @@ fn copy_resource() -> Result<(), Box<dyn std::error::Error>> {
     };
     let binaries_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("binaries");
     let ffmpeg = binaries_dir.join(format!("ffm-{target}{extension}"));
-    fs::copy(ffmpeg, binaries_dir.join("ffm"))?;
+    if ffmpeg.exists() {
+        fs::copy(ffmpeg, binaries_dir.join("ffm"))?;
+        return Ok(());
+    }
+    let ffmpeg = binaries_dir.join(format!("ffmpeg{extension}"));
+    if ffmpeg.exists() {
+        fs::copy(ffmpeg, binaries_dir.join("ffm"))?;
+    }
     Ok(())
 }
 
@@ -128,16 +126,19 @@ fn inject_build_metadata() {
     println!("cargo:rerun-if-env-changed=RUSTC");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:warning=manifest_dir = {}", manifest_dir.display());
+    let repository_dir = manifest_dir.parent().unwrap_or(manifest_dir.as_path());
     let git_hash = command_output(Command::new("git").current_dir(&manifest_dir).args([
+        "-c",
+        &format!("safe.directory={}", repository_dir.display()),
         "rev-parse",
         "--short",
         "HEAD",
     ]))
-    .unwrap_or_else(|| "unknown".to_string());
+    .expect("无法获取 Git commit 信息");
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let rust_version = command_output(Command::new(rustc).arg("--version"))
-        .unwrap_or_else(|| "unknown".to_string());
-    let package_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let rust_version = command_output(Command::new(rustc).arg("--version")).unwrap();
+    let package_version = env::var("CARGO_PKG_VERSION").unwrap();
 
     let output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("build_info.rs");
     fs::write(
@@ -159,105 +160,6 @@ fn command_output(command: &mut Command) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-#[cfg(feature = "gui")]
-fn build_macos_sidecars() -> Result<(), Box<dyn std::error::Error>> {
-    let target = env::var("TARGET")?;
-    if !target.ends_with("-apple-darwin") {
-        return Err(format!("macOS 主机不能为目标 {target} 编译原生 FFmpeg sidecar。").into());
-    }
-
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let binaries_dir = manifest_dir.join("binaries");
-    let ffmpeg = binaries_dir.join(format!("ffm-{target}"));
-    let ffprobe = binaries_dir.join(format!("ffp-{target}"));
-    if ffmpeg.is_file() && ffprobe.is_file() {
-        return Ok(());
-    }
-
-    let source_dir = PathBuf::from(env::var("OUT_DIR")?).join("ffmpeg-release-8.1");
-    if !source_dir.join(".git").is_dir() {
-        if source_dir.exists() {
-            fs::remove_dir_all(&source_dir)?;
-        }
-        println!("cargo:warning=Cloning FFmpeg {FFMPEG_SOURCE_REF} for macOS sidecars");
-        run_command(
-            Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--branch",
-                    FFMPEG_SOURCE_REF,
-                    FFMPEG_SOURCE_URL,
-                ])
-                .arg(&source_dir),
-            "克隆 FFmpeg 源码",
-        )?;
-    }
-
-    let jobs = std::thread::available_parallelism()?.get().to_string();
-    println!("cargo:warning=Building native macOS FFmpeg sidecars for {target}");
-    run_command(
-        Command::new(source_dir.join("configure"))
-            .current_dir(&source_dir)
-            .args([
-                "--disable-everything",
-                "--extra-cflags=-march=native -mtune=native",
-                "--disable-debug",
-                "--disable-stripping",
-                "--enable-static",
-                "--disable-shared",
-                "--enable-pthreads",
-                "--disable-pic",
-                "--disable-autodetect",
-                "--disable-programs",
-                "--disable-doc",
-                "--disable-gpl",
-                "--disable-version3",
-                "--disable-nonfree",
-                "--enable-avcodec",
-                "--disable-avdevice",
-                "--enable-avformat",
-                "--disable-swresample",
-                "--disable-swscale",
-                "--extra-cflags=-w",
-                "--enable-ffmpeg",
-                "--enable-ffprobe",
-                "--enable-avfilter",
-                "--enable-protocol=file,pipe",
-                "--enable-demuxer=matroska,ass,srt",
-                "--enable-muxer=matroska,ass,srt",
-                "--enable-decoder=h264,aac,ass,ssa,subrip",
-                "--enable-encoder=ass,ssa,subrip",
-            ]),
-        "配置 FFmpeg",
-    )?;
-    run_command(
-        Command::new("make")
-            .current_dir(&source_dir)
-            .arg(format!("-j{jobs}")),
-        "编译 FFmpeg",
-    )?;
-
-    fs::create_dir_all(&binaries_dir)?;
-    fs::copy(source_dir.join("ffmpeg"), &ffmpeg)?;
-    fs::copy(source_dir.join("ffprobe"), &ffprobe)?;
-    make_executable(&ffmpeg)?;
-    make_executable(&ffprobe)?;
-    ensure_binaries_exist(&ffmpeg, &ffprobe)
-}
-
-#[cfg(feature = "gui")]
-fn run_command(command: &mut Command, action: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{action}失败，退出码：{status}").into())
-    }
-}
-
-#[cfg(feature = "gui")]
 fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     let target = env::var("TARGET")?;
     let extension = if target.contains("windows") {
@@ -267,9 +169,8 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     };
     let binaries_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("binaries");
     let ffmpeg = binaries_dir.join(format!("ffm-{target}{extension}"));
-    let ffprobe = binaries_dir.join(format!("ffp-{target}{extension}"));
 
-    if ffmpeg.is_file() && ffprobe.is_file() {
+    if ffmpeg.is_file() {
         return Ok(());
     }
 
@@ -285,16 +186,14 @@ fn download_sidecars() -> Result<(), Box<dyn std::error::Error>> {
     response.into_reader().read_to_end(&mut archive)?;
 
     if archive_name.ends_with(".zip") {
-        extract_zip(&archive, &ffmpeg, &ffprobe)?;
+        extract_zip(&archive, &ffmpeg)?;
     } else {
-        extract_tar_xz(&archive, &ffmpeg, &ffprobe)?;
+        extract_tar_xz(&archive, &ffmpeg)?;
     }
     make_executable(&ffmpeg)?;
-    make_executable(&ffprobe)?;
     Ok(())
 }
 
-#[cfg(feature = "gui")]
 fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     let name = match target {
         "x86_64-unknown-linux-gnu" => "ffmpeg-n8.1-latest-linux64.zip",
@@ -306,78 +205,64 @@ fn archive_name(target: &str) -> Result<&'static str, Box<dyn std::error::Error>
     Ok(name)
 }
 
-#[cfg(feature = "gui")]
-fn extract_zip(
-    archive: &[u8],
-    ffmpeg: &Path,
-    ffprobe: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_zip(archive: &[u8], ffmpeg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(archive))?;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;
-        let destination = match executable_destination(entry.name(), ffmpeg, ffprobe) {
+        let destination = match executable_destination(entry.name(), ffmpeg) {
             Some(destination) => destination,
             None => continue,
         };
         copy_entry(&mut entry, destination)?;
     }
-    ensure_binaries_exist(ffmpeg, ffprobe)
+    ensure_binaries_exist(ffmpeg)
 }
 
-#[cfg(feature = "gui")]
-fn extract_tar_xz(
-    archive: &[u8],
-    ffmpeg: &Path,
-    ffprobe: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_tar_xz(archive: &[u8], ffmpeg: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let decoder = xz2::read::XzDecoder::new(Cursor::new(archive));
     let mut tar = tar::Archive::new(decoder);
     for entry in tar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        let destination = match executable_destination(&path.to_string_lossy(), ffmpeg, ffprobe) {
+        let destination = match executable_destination(&path.to_string_lossy(), ffmpeg) {
             Some(destination) => destination,
             None => continue,
         };
         copy_entry(&mut entry, destination)?;
     }
-    ensure_binaries_exist(ffmpeg, ffprobe)
+    ensure_binaries_exist(ffmpeg)
 }
 
-#[cfg(feature = "gui")]
-fn executable_destination<'a>(path: &str, ffmpeg: &'a Path, ffprobe: &'a Path) -> Option<&'a Path> {
+fn executable_destination<'a>(path: &str, ffmpeg: &'a Path) -> Option<&'a Path> {
     let file_name = Path::new(path).file_name()?.to_str()?;
     match file_name {
         "ffmpeg" | "ffmpeg.exe" => Some(ffmpeg),
-        "ffprobe" | "ffprobe.exe" => Some(ffprobe),
         _ => None,
     }
 }
 
-#[cfg(feature = "gui")]
 fn copy_entry(reader: &mut impl Read, destination: &Path) -> io::Result<()> {
     let mut output = File::create(destination)?;
     io::copy(reader, &mut output)?;
     Ok(())
 }
 
-#[cfg(feature = "gui")]
-fn ensure_binaries_exist(ffmpeg: &Path, ffprobe: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if ffmpeg.is_file() && ffprobe.is_file() {
+fn ensure_binaries_exist(ffmpeg: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if ffmpeg.is_file() {
         Ok(())
     } else {
-        Err("下载的 FFmpeg 发布包中缺少 ffmpeg 或 ffprobe。".into())
+        Err("下载的 FFmpeg 发布包中缺少 ffmpeg 。".into())
     }
 }
 
-#[cfg(all(feature = "gui", unix))]
+#[cfg(unix)]
 fn make_executable(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
-#[cfg(all(feature = "gui", not(unix)))]
+#[cfg(not(unix))]
 fn make_executable(_: &Path) -> io::Result<()> {
     Ok(())
 }
