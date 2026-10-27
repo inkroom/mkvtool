@@ -388,21 +388,27 @@ trait FfmpegService: Send + Sync {
 }
 
 enum ActiveFfmpegService {
+    Mkvmerge(MkvmergeFfmpegService),
     Ffi(FFIFfmpegService),
     Cli(CliFfmpegService),
 }
 
 impl ActiveFfmpegService {
     fn new() -> Self {
-        CliFfmpegService::detect()
-            .map(Self::Cli)
-            .unwrap_or_else(|| Self::Ffi(FFIFfmpegService::new()))
+        if let Some(service) = MkvmergeFfmpegService::detect() {
+            Self::Mkvmerge(service)
+        } else if let Some(service) = CliFfmpegService::detect() {
+            Self::Cli(service)
+        } else {
+            Self::Ffi(FFIFfmpegService::new())
+        }
     }
 }
 
 impl FfmpegService for ActiveFfmpegService {
     fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
         match self {
+            Self::Mkvmerge(service) => service.inspect(path),
             Self::Ffi(service) => service.inspect(path),
             Self::Cli(service) => service.inspect(path),
         }
@@ -410,6 +416,7 @@ impl FfmpegService for ActiveFfmpegService {
 
     fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String> {
         match self {
+            Self::Mkvmerge(service) => service.read_subtitle(path, stream_index),
             Self::Ffi(service) => service.read_subtitle(path, stream_index),
             Self::Cli(service) => service.read_subtitle(path, stream_index),
         }
@@ -425,6 +432,14 @@ impl FfmpegService for ActiveFfmpegService {
         font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
         match self {
+            Self::Mkvmerge(service) => service.remux_subtitles(
+                input,
+                output,
+                edits,
+                selected_stream_indices,
+                default_subtitle,
+                font_attachments,
+            ),
             Self::Ffi(service) => service.remux_subtitles(
                 input,
                 output,
@@ -562,7 +577,7 @@ fn prepare_font_attachments(
     }
 
     let text = match service {
-        ActiveFfmpegService::Ffi(_) => {
+        ActiveFfmpegService::Ffi(_) | ActiveFfmpegService::Mkvmerge(_) => {
             subtitle_text.ok_or_else(|| "FFI 导出时缺少已读取的字幕文本。".to_string())?
         }
         ActiveFfmpegService::Cli(_) => {
@@ -2022,6 +2037,462 @@ pub fn save_subtitles_path(
     )
 }
 
+#[derive(serde::Deserialize)]
+struct MkvmergeIdentification {
+    tracks: Vec<MkvmergeTrack>,
+    #[serde(default)]
+    attachments: Vec<MkvmergeAttachment>,
+}
+
+#[derive(serde::Deserialize)]
+struct MkvmergeTrack {
+    id: u32,
+    #[serde(rename = "type")]
+    track_type: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MkvmergeAttachment {
+    id: u32,
+}
+
+struct TemporaryRemuxFiles {
+    directory: PathBuf,
+}
+
+impl TemporaryRemuxFiles {
+    fn new() -> Result<Self, String> {
+        for attempt in 0..100_u32 {
+            let directory = std::env::temp_dir()
+                .join(format!("mkvtool-remux-{}-{attempt}", std::process::id()));
+            match fs::create_dir(&directory) {
+                Ok(()) => return Ok(Self { directory }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("无法创建临时目录：{error}")),
+            }
+        }
+        Err("无法创建唯一的临时目录。".to_string())
+    }
+
+    fn path(&self, name: impl AsRef<Path>) -> PathBuf {
+        self.directory.join(name)
+    }
+}
+
+impl Drop for TemporaryRemuxFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+struct MkvmergeFfmpegService {
+    ffi: FFIFfmpegService,
+    executable: PathBuf,
+}
+
+impl MkvmergeFfmpegService {
+    fn detect() -> Option<Self> {
+        let mut candidates = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .map(|directory| vec![directory.join("mkvmerge"), directory.join("mkvmerge.exe")])
+            .unwrap_or_default();
+        candidates.extend([PathBuf::from("mkvmerge"), PathBuf::from("mkvmerge.exe")]);
+        candidates.into_iter().find_map(|executable| {
+            Command::new(&executable)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok()
+                .filter(|status| status.success())
+                .map(|_| Self {
+                    ffi: FFIFfmpegService::new(),
+                    executable,
+                })
+        })
+    }
+
+    fn identify(&self, input: &Path) -> Result<MkvmergeIdentification, String> {
+        let output = self
+            .command()
+            .args(["--identification-format", "json", "--identify"])
+            .arg(input)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "无法启动 mkvmerge，请从 https://mkvtoolnix.download/downloads.html 安装 MKVToolNix：{error}"
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Self::command_error(&output.stderr));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("无法解析 mkvmerge 媒体信息：{error}"))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn command(&self) -> Command {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(&self.executable);
+        command.creation_flags(0x08000000);
+        command
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn command(&self) -> Command {
+        Command::new(&self.executable)
+    }
+
+    fn command_error(stderr: &[u8]) -> String {
+        let detail = String::from_utf8_lossy(stderr).trim().to_string();
+        if detail.is_empty() {
+            "mkvmerge 执行失败。".to_string()
+        } else {
+            format!("mkvmerge 执行失败：{detail}")
+        }
+    }
+
+    fn track_type(stream_type: MediaStreamType) -> Option<&'static str> {
+        match stream_type {
+            MediaStreamType::Video => Some("video"),
+            MediaStreamType::Audio => Some("audio"),
+            MediaStreamType::Subtitle => Some("subtitles"),
+            MediaStreamType::Data => Some("buttons"),
+            _ => None,
+        }
+    }
+
+    fn push_track_selection(command: &mut Command, option: &str, ids: &[u32], disabled: &str) {
+        if ids.is_empty() {
+            command.arg(disabled);
+        } else {
+            command
+                .arg(option)
+                .arg(ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+        }
+    }
+}
+
+impl FfmpegService for MkvmergeFfmpegService {
+    fn inspect(&self, path: &Path) -> Result<MediaFile, String> {
+        self.ffi.inspect(path)
+    }
+
+    fn read_subtitle(&self, path: &Path, stream_index: u32) -> Result<SubtitleDocument, String> {
+        self.ffi.read_subtitle(path, stream_index)
+    }
+
+    fn remux_subtitles(
+        &self,
+        input: &Path,
+        output: &Path,
+        edits: &[SubtitleEdit],
+        selected_stream_indices: &[u32],
+        default_subtitle: Option<DefaultSubtitleSelector>,
+        font_attachments: &[FontAttachment],
+    ) -> Result<(), String> {
+        let media = self.ffi.inspect(input)?;
+        let identification = self.identify(input)?;
+        let selected = selected_stream_indices
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if selected.is_empty() {
+            return Err("请至少选择一条要导出的流。".to_string());
+        }
+
+        let mut track_ids = HashMap::new();
+        let media_tracks = media
+            .streams
+            .iter()
+            .filter(|stream| stream.stream_type != MediaStreamType::Attachment)
+            .collect::<Vec<_>>();
+        if media_tracks.len() != identification.tracks.len() {
+            return Err("FFmpeg 与 mkvmerge 识别到的轨道数量不一致。".to_string());
+        }
+        for (stream, track) in media_tracks.iter().zip(&identification.tracks) {
+            if let Some(expected_type) = Self::track_type(stream.stream_type) {
+                if track.track_type != expected_type {
+                    return Err(format!(
+                        "FFmpeg 与 mkvmerge 对输入流 #{} 的类型识别不一致。",
+                        stream.index
+                    ));
+                }
+            } else if selected.contains(&stream.index) {
+                return Err(format!(
+                    "mkvmerge 暂不支持导出 {:?} 流 #{}。",
+                    stream.stream_type, stream.index
+                ));
+            }
+            track_ids.insert(stream.index, track.id);
+        }
+
+        let media_attachments = media
+            .streams
+            .iter()
+            .filter(|stream| stream.stream_type == MediaStreamType::Attachment)
+            .collect::<Vec<_>>();
+        if media_attachments.len() != identification.attachments.len() {
+            return Err("FFmpeg 与 mkvmerge 识别到的附件数量不一致。".to_string());
+        }
+        let mut attachment_ids = HashMap::new();
+        for (stream, attachment) in media_attachments.iter().zip(&identification.attachments) {
+            attachment_ids.insert(stream.index, attachment.id);
+        }
+
+        let mut replacements = HashMap::new();
+        let mut new_subtitles = Vec::new();
+        for (edit_index, edit) in edits.iter().enumerate() {
+            validate_new_subtitle_edit(edit)?;
+            if edit.new_stream {
+                new_subtitles.push((edit_index, edit));
+            } else {
+                let stream = media
+                    .streams
+                    .iter()
+                    .find(|stream| stream.index == edit.stream_index)
+                    .ok_or_else(|| format!("未找到字幕流 #{}。", edit.stream_index))?;
+                if !stream.editable {
+                    return Err("只能修改可编辑的文本字幕流。".to_string());
+                }
+                if replacements
+                    .insert(edit.stream_index, (edit_index, edit))
+                    .is_some()
+                {
+                    return Err(format!("字幕流 #{} 被重复提交。", edit.stream_index));
+                }
+            }
+        }
+        if !new_subtitles.is_empty() && !selected.contains(&NEW_SUBTITLE_STREAM_INDEX) {
+            return Err("新建字幕必须被选择导出。".to_string());
+        }
+
+        let temporary = TemporaryRemuxFiles::new()?;
+        let mut edit_paths = HashMap::new();
+        for (edit_index, edit) in edits.iter().enumerate() {
+            let format = edit
+                .format
+                .as_deref()
+                .or_else(|| {
+                    media
+                        .streams
+                        .iter()
+                        .find(|stream| stream.index == edit.stream_index)
+                        .and_then(|stream| stream.subtitle.as_ref())
+                        .map(|subtitle| subtitle.format.as_str())
+                })
+                .ok_or_else(|| "无法确定字幕格式。".to_string())?;
+            if !matches!(format, "ass" | "srt") {
+                return Err("字幕格式只能是 ass 或 srt。".to_string());
+            }
+            let path = temporary.path(format!("subtitle-{edit_index}.{format}"));
+            fs::write(&path, edit.content.as_bytes())
+                .map_err(|error| format!("无法写入临时字幕文件：{error}"))?;
+            edit_paths.insert(edit_index, path);
+        }
+
+        enum OrderedTrack<'a> {
+            Original(&'a MediaStream),
+            External(usize, &'a SubtitleEdit),
+        }
+        let mut ordered_tracks = Vec::new();
+        let mut inserted_new_subtitles = false;
+        for stream in media
+            .streams
+            .iter()
+            .filter(|stream| stream.stream_type != MediaStreamType::Attachment)
+        {
+            if stream.stream_type == MediaStreamType::Subtitle && !inserted_new_subtitles {
+                ordered_tracks.extend(
+                    new_subtitles
+                        .iter()
+                        .map(|(index, edit)| OrderedTrack::External(*index, *edit)),
+                );
+                inserted_new_subtitles = true;
+            }
+            if !selected.contains(&stream.index) {
+                continue;
+            }
+            if let Some((edit_index, edit)) = replacements.get(&stream.index) {
+                ordered_tracks.push(OrderedTrack::External(*edit_index, *edit));
+            } else {
+                ordered_tracks.push(OrderedTrack::Original(stream));
+            }
+        }
+        if !inserted_new_subtitles {
+            ordered_tracks.extend(
+                new_subtitles
+                    .iter()
+                    .map(|(index, edit)| OrderedTrack::External(*index, *edit)),
+            );
+        }
+
+        let mut command = self.command();
+        command.arg("--output").arg(output);
+        let mut video_ids = Vec::new();
+        let mut audio_ids = Vec::new();
+        let mut subtitle_ids = Vec::new();
+        let mut button_ids = Vec::new();
+        for stream in media
+            .streams
+            .iter()
+            .filter(|stream| selected.contains(&stream.index))
+        {
+            if replacements.contains_key(&stream.index) {
+                continue;
+            }
+            let Some(&track_id) = track_ids.get(&stream.index) else {
+                continue;
+            };
+            match stream.stream_type {
+                MediaStreamType::Video => video_ids.push(track_id),
+                MediaStreamType::Audio => audio_ids.push(track_id),
+                MediaStreamType::Subtitle => subtitle_ids.push(track_id),
+                MediaStreamType::Data => button_ids.push(track_id),
+                _ => {}
+            }
+        }
+        Self::push_track_selection(&mut command, "--video-tracks", &video_ids, "--no-video");
+        Self::push_track_selection(&mut command, "--audio-tracks", &audio_ids, "--no-audio");
+        Self::push_track_selection(
+            &mut command,
+            "--subtitle-tracks",
+            &subtitle_ids,
+            "--no-subtitles",
+        );
+        Self::push_track_selection(&mut command, "--button-tracks", &button_ids, "--no-buttons");
+        let selected_attachment_ids = media
+            .streams
+            .iter()
+            .filter(|stream| {
+                stream.stream_type == MediaStreamType::Attachment
+                    && selected.contains(&stream.index)
+            })
+            .filter_map(|stream| attachment_ids.get(&stream.index).copied())
+            .collect::<Vec<_>>();
+        if selected_attachment_ids.is_empty() {
+            command.arg("--no-attachments");
+        } else {
+            command.arg("--attachments").arg(
+                selected_attachment_ids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+
+        let mut matched_default = false;
+        for (output_index, track) in ordered_tracks.iter().enumerate() {
+            if let OrderedTrack::Original(stream) = track {
+                if stream.stream_type == MediaStreamType::Subtitle {
+                    let is_default =
+                        is_default_existing_subtitle(default_subtitle, stream.index, output_index);
+                    matched_default |= is_default;
+                    command.arg("--default-track-flag").arg(format!(
+                        "{}:{}",
+                        track_ids[&stream.index],
+                        u8::from(is_default)
+                    ));
+                }
+            }
+        }
+        command.arg(input);
+
+        let mut external_input_number = 1usize;
+        let mut track_order = Vec::with_capacity(ordered_tracks.len());
+        for (output_index, track) in ordered_tracks.iter().enumerate() {
+            match track {
+                OrderedTrack::Original(stream) => {
+                    track_order.push(format!("0:{}", track_ids[&stream.index]));
+                }
+                OrderedTrack::External(edit_index, edit) => {
+                    let position = new_subtitles
+                        .iter()
+                        .position(|(index, _)| index == edit_index)
+                        .unwrap_or(usize::MAX);
+                    let is_default = if position == usize::MAX {
+                        matches!(
+                            default_subtitle,
+                            Some(DefaultSubtitleSelector::InputStream(index)) if index == edit.stream_index
+                        ) || matches!(
+                            default_subtitle,
+                            Some(DefaultSubtitleSelector::OutputStream(index)) if index == output_index as u32
+                        )
+                    } else {
+                        is_default_new_subtitle(default_subtitle, output_index, position)
+                    };
+                    let source_stream = (!edit.new_stream)
+                        .then(|| {
+                            media
+                                .streams
+                                .iter()
+                                .find(|stream| stream.index == edit.stream_index)
+                        })
+                        .flatten();
+                    let language = edit
+                        .language
+                        .as_deref()
+                        .or_else(|| source_stream.and_then(|stream| stream.language.as_deref()))
+                        .unwrap_or("und");
+                    let title = edit
+                        .title
+                        .as_deref()
+                        .or_else(|| source_stream.and_then(|stream| stream.title.as_deref()))
+                        .unwrap_or("");
+                    let forced = source_stream.is_some_and(|stream| stream.forced);
+                    matched_default |= is_default;
+                    command
+                        .args(["--language", &format!("0:{language}")])
+                        .args(["--track-name", &format!("0:{title}")])
+                        .args([
+                            "--default-track-flag",
+                            &format!("0:{}", u8::from(is_default)),
+                        ])
+                        .args(["--forced-display-flag", &format!("0:{}", u8::from(forced))])
+                        .arg(&edit_paths[edit_index]);
+                    track_order.push(format!("{external_input_number}:0"));
+                    external_input_number += 1;
+                }
+            }
+        }
+        if matches!(default_subtitle, Some(_)) && !matched_default {
+            return Err("默认字幕必须是输出文件中的字幕流。".to_string());
+        }
+        command.arg("--track-order").arg(track_order.join(","));
+
+        for (font_index, font) in font_attachments.iter().enumerate() {
+            let (filename, mime_type, content) = font_attachment_data(font)?;
+            let path = if font.content.is_some() {
+                let path = temporary.path(format!("attachment-{font_index}-{filename}"));
+                fs::write(&path, content)
+                    .map_err(|error| format!("无法写入临时字体文件：{error}"))?;
+                path
+            } else {
+                PathBuf::from(&font.path)
+            };
+            command
+                .args(["--attachment-name", &filename])
+                .args(["--attachment-mime-type", mime_type])
+                .arg("--attach-file")
+                .arg(path);
+        }
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let result = command
+            .output()
+            .map_err(|error| {
+                format!(
+                    "无法启动 mkvmerge，请从 https://mkvtoolnix.download/downloads.html 安装 MKVToolNix：{error}"
+                )
+            })?;
+        if !result.status.success() && result.status.code() != Some(1) {
+            return Err(Self::command_error(&result.stderr));
+        }
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 struct CliNewSubtitle {
     content: String,
@@ -3430,6 +3901,76 @@ mod tests {
             .map(|(text, _, _)| text)
             .collect::<Vec<_>>();
         assert_eq!(read_text, written_text);
+    }
+
+    #[test]
+    fn remuxes_with_mkvmerge_and_reads_with_ffi() {
+        let _lock = ffmpeg_test_lock();
+        let Some(service) = MkvmergeFfmpegService::detect() else {
+            return;
+        };
+        let input = download_test_mkv("test2.mkv").expect("测试文件应下载到 target 目录");
+        let media = service.inspect(&input).expect("FFI 应能探测测试文件");
+        let output = test_target_dir()
+            .expect("应能定位 Cargo target 目录")
+            .join("ffmpeg-test-fixtures")
+            .join("remuxed-with-mkvmerge.mkv");
+        let content = "1\n00:00:01,001 --> 00:00:02,501\n由 mkvmerge 新建的字幕\n\n";
+        let mut selected_stream_indices = media
+            .streams
+            .iter()
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        selected_stream_indices.push(NEW_SUBTITLE_STREAM_INDEX);
+        let first_subtitle_index = media
+            .streams
+            .iter()
+            .position(|stream| stream.stream_type == MediaStreamType::Subtitle)
+            .expect("测试文件应包含字幕流") as u32;
+
+        service
+            .remux_subtitles(
+                &input,
+                &output,
+                &[SubtitleEdit {
+                    stream_index: NEW_SUBTITLE_STREAM_INDEX,
+                    content: content.to_string(),
+                    format: Some("srt".to_string()),
+                    language: Some("chi".to_string()),
+                    title: Some("MKVToolNix 字幕测试".to_string()),
+                    new_stream: true,
+                }],
+                &selected_stream_indices,
+                Some(DefaultSubtitleSelector::OutputStream(first_subtitle_index)),
+                &[],
+            )
+            .expect("mkvmerge 应能重混流字幕");
+
+        let output_media = service
+            .inspect(&output)
+            .expect("FFI 应能探测 mkvmerge 输出");
+        let subtitle = output_media
+            .streams
+            .iter()
+            .find(|stream| stream.title.as_deref() == Some("MKVToolNix 字幕测试"))
+            .expect("输出应包含新字幕");
+        assert_eq!(subtitle.index, first_subtitle_index);
+        assert_eq!(subtitle.language.as_deref(), Some("chi"));
+        assert!(subtitle.default_stream);
+        assert_eq!(
+            output_media
+                .streams
+                .iter()
+                .filter(|stream| {
+                    stream.stream_type == MediaStreamType::Subtitle && stream.default_stream
+                })
+                .count(),
+            1
+        );
+        let read = service
+            .read_subtitle(&output, subtitle.index)
+            .expect("FFI 应能读取 mkvmerge 新建的字幕");
+        assert!(read.content.contains("由 mkvmerge 新建的字幕"));
     }
 
     #[test]
