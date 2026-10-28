@@ -110,6 +110,14 @@ fn is_default_existing_subtitle(
     )
 }
 
+/// Normalizes packets that FFmpeg exposes after Matroska content-encoding handling.
+///
+/// 中文：用于修复带 zlib Content Encoding 的媒体包。若直接复制 FFmpeg 暴露的压缩字节，
+/// 输出虽然能被 ffprobe 识别，但 VLC 会黑屏无声；音频包还需要 Matroska 期望的关键帧标记。
+///
+/// The affected fixtures carry zlib-compressed video Blocks.  Copying those bytes as if they were
+/// ordinary codec packets produced a file that ffprobe could identify but VLC played as
+/// black/silent.  Audio packets also need the key flag expected by the Matroska muxer.
 fn normalize_media_packet(
     packet: ffmpeg_next::Packet,
     medium: ffmpeg_next::media::Type,
@@ -627,11 +635,144 @@ impl FFIFfmpegService {
         Self
     }
 
+    /// Produces the UTC timestamp format used by MKVToolNix statistics tags.
+    ///
+    /// 中文：生成 MKVToolNix 统计标签使用的 UTC 时间格式；这里避免仅为描述性 metadata
+    /// 引入额外日期依赖，同时缩小 FFI 与 mkvmerge 输出之间无关的差异。
+    ///
+    /// This is deliberately implemented without an additional date/time dependency: the value is
+    /// only descriptive metadata, but omitting it makes an FFI-remuxed subtitle track materially
+    /// different from the same track written by mkvmerge and complicates player compatibility
+    /// comparisons.
+    fn statistics_writing_date_utc() -> String {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let days = seconds.div_euclid(86_400);
+        let seconds_of_day = seconds.rem_euclid(86_400);
+        let shifted_days = days + 719_468;
+        let era = shifted_days.div_euclid(146_097);
+        let day_of_era = shifted_days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let mut year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_parameter = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_parameter + 2) / 5 + 1;
+        let month = month_parameter + if month_parameter < 10 { 3 } else { -9 };
+        year += i64::from(month <= 2);
+        let hour = seconds_of_day / 3_600;
+        let minute = seconds_of_day / 60 % 60;
+        let second = seconds_of_day % 60;
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    }
+
+    /// Computes the statistics for exactly the packets that the FFI remuxer will write.
+    ///
+    /// 中文：统计 FFI 实际将写出的字幕包。SRT/ASS 转换后包数、大小和码率都会变化，
+    /// 继续复制源轨统计值会产生看似合理但实际错误的 metadata。
+    ///
+    /// Copying the source track's tags is incorrect after SRT/ASS conversion: frame count, payload
+    /// size and bitrate all change.  Missing/stale values were also one of the observable
+    /// differences between the VLC-compatible mkvmerge output and the FFI output.
+    fn subtitle_statistics(
+        edit: &SubtitleEdit,
+        time_base: ffmpeg_next::Rational,
+    ) -> Result<(String, String, String, String), String> {
+        let format = edit.format.as_deref().expect("validated subtitle format");
+        let packets = if format == "ass" {
+            let events = Self::ass_document_parts(&edit.content)?.1;
+            Self::ass_packets(events, time_base)?
+        } else {
+            Self::srt_packets(&edit.content, time_base)?
+        };
+        let first_pts = packets
+            .iter()
+            .map(|(_, pts, _)| *pts)
+            .min()
+            .unwrap_or_default();
+        let end_pts = packets
+            .iter()
+            .map(|(_, pts, duration)| pts.saturating_add(*duration))
+            .max()
+            .unwrap_or(first_pts);
+        let duration_ticks = end_pts.saturating_sub(first_pts);
+        let numerator = i128::from(time_base.numerator());
+        let denominator = i128::from(time_base.denominator());
+        let duration_nanoseconds = i128::from(duration_ticks)
+            .saturating_mul(numerator)
+            .saturating_mul(1_000_000_000)
+            .checked_div(denominator)
+            .unwrap_or_default()
+            .max(0);
+        let total_seconds = duration_nanoseconds / 1_000_000_000;
+        let duration = format!(
+            "{:02}:{:02}:{:02}.{:09}",
+            total_seconds / 3_600,
+            total_seconds / 60 % 60,
+            total_seconds % 60,
+            duration_nanoseconds % 1_000_000_000
+        );
+        let bytes = packets
+            .iter()
+            .map(|(payload, _, _)| payload.len() as u64)
+            .sum::<u64>();
+        let bits_per_second = if duration_nanoseconds == 0 {
+            0
+        } else {
+            (u128::from(bytes) * 8 * 1_000_000_000 / duration_nanoseconds as u128) as u64
+        };
+        Ok((
+            bits_per_second.to_string(),
+            duration,
+            packets.len().to_string(),
+            bytes.to_string(),
+        ))
+    }
+
+    /// Adds the conventional MKVToolNix-style statistics tags before `write_header`.
+    ///
+    /// 中文：必须在写 Matroska 头之前设置统计标签；写包之后再设置已经无法进入 TrackEntry。
+    /// FFmpeg 可能在 trailer 阶段按自己的口径覆盖 DURATION，这是 muxer 的既有行为。
+    ///
+    /// Matroska track metadata is serialized with the header, so adding it after packets have been
+    /// written is too late.  FFmpeg may still replace `DURATION` in `write_trailer` using its own
+    /// zero-based duration convention; the remaining values continue to describe our payloads.
+    fn set_subtitle_statistics(
+        metadata: &mut ffmpeg_next::Dictionary<'_>,
+        edit: &SubtitleEdit,
+        time_base: ffmpeg_next::Rational,
+        writing_date: &str,
+    ) -> Result<(), String> {
+        let (bps, duration, frames, bytes) = Self::subtitle_statistics(edit, time_base)?;
+        metadata.set("BPS", &bps);
+        metadata.set("DURATION", &duration);
+        metadata.set("NUMBER_OF_FRAMES", &frames);
+        metadata.set("NUMBER_OF_BYTES", &bytes);
+        metadata.set("_STATISTICS_WRITING_APP", "mkvtool FFmpeg FFI");
+        metadata.set("_STATISTICS_WRITING_DATE_UTC", writing_date);
+        metadata.set(
+            "_STATISTICS_TAGS",
+            "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES",
+        );
+        Ok(())
+    }
+
+    /// Creates an output subtitle track, including the Matroska ASS CodecPrivate when applicable.
+    ///
+    /// 中文：创建字幕轨时同步写入 ASS CodecPrivate。脚本头/样式属于 CodecPrivate，事件才
+    /// 属于 Block；两者混放会造成外挂 ASS 正常、内嵌 ASS 在 VLC 中不显示。
+    ///
+    /// ASS script/style headers belong in CodecPrivate; only event payloads belong in Blocks.  VLC
+    /// can parse an external `.ass` while refusing the embedded track when this split is wrong, so
+    /// keep header construction here coupled to stream creation.
     fn add_new_subtitle_stream(
         output: &mut ffmpeg_next::format::context::Output,
         edit: &SubtitleEdit,
         default_subtitle: Option<DefaultSubtitleSelector>,
         position: usize,
+        writing_date: &str,
     ) -> Result<usize, String> {
         let format = edit
             .format
@@ -671,6 +812,12 @@ impl FFIFfmpegService {
             "title",
             edit.title.as_deref().expect("validated new subtitle title"),
         );
+        Self::set_subtitle_statistics(
+            &mut metadata,
+            edit,
+            ffmpeg_next::Rational::new(1, 1_000),
+            writing_date,
+        )?;
         stream.set_metadata(metadata);
         let output_stream_index = stream.index();
         unsafe {
@@ -736,6 +883,14 @@ impl FFIFfmpegService {
         Ok((header, &content[dialogue_start..]))
     }
 
+    /// Builds Matroska `CodecPrivate` from the non-event portion of an ASS document.
+    ///
+    /// 中文：只把 ASS 的脚本头、样式及事件格式放入 CodecPrivate，并规范为 CRLF 和末尾
+    /// 空行，避免 VLC 将第一条事件误当作头部内容。
+    ///
+    /// Matroska stores `[Script Info]`, styles and the event format here, while individual Blocks
+    /// contain only event fields.  CRLF plus the final blank line mirrors mkvmerge/FFmpeg output and
+    /// avoids VLC treating the first embedded event as part of the header.
     fn matroska_ass_header(content: &str) -> Result<String, String> {
         let (header, _) = Self::ass_document_parts(content)?;
         Ok(format!(
@@ -842,6 +997,14 @@ impl FFIFfmpegService {
             / (100 * numerator))
     }
 
+    /// Converts ASS `Dialogue` lines into Matroska ASS Block payloads and timestamps.
+    ///
+    /// 中文：Matroska ASS Block 必须以 `ReadOrder,Layer,...` 开始，不能直接写完整的
+    /// `Dialogue:` 行；后者可能在 Jellyfin 转码时可用，却无法被 VLC 直接渲染。
+    ///
+    /// A Block must start with `ReadOrder,Layer,...`; writing a complete `Dialogue:` line (including
+    /// Start/End) is valid as an external ASS file but invalid inside Matroska and was a direct cause
+    /// of embedded subtitles that Jellyfin could transcode yet VLC would not render.
     fn ass_packets(
         content: &str,
         time_base: ffmpeg_next::Rational,
@@ -1471,6 +1634,41 @@ impl FfmpegService for FFIFfmpegService {
         let mut output = ffmpeg_next::format::output(output_path)
             .map_err(|error| format!("无法创建输出文件：{error}"))?;
         output.set_metadata(input.metadata().to_owned());
+        // 中文：Matroska 不只有流和附件。旧 FFI 路径会丢失回归样本中的 5 个章节，
+        // 而 mkvmerge 默认保留；先快照输入章节，再完整复制 ID、时间基、范围及 metadata。
+        // English: Streams and attachments are not the whole Matroska presentation. The old FFI path
+        // silently dropped all chapters (five in the Nix-Raws regression fixture), whereas
+        // mkvmerge preserves them by default.  Snapshot first to avoid borrowing `input` while the
+        // independently-owned output context is being mutated, then reproduce every chapter field.
+        let chapters = input
+            .chapters()
+            .map(|chapter| {
+                (
+                    chapter.id(),
+                    chapter.time_base(),
+                    chapter.start(),
+                    chapter.end(),
+                    chapter
+                        .metadata()
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (id, time_base, start, end, metadata) in chapters {
+            let title = metadata
+                .iter()
+                .find_map(|(key, value)| (key == "title").then_some(value.as_str()))
+                .unwrap_or("");
+            let mut chapter = output
+                .add_chapter(id, time_base, start, end, title)
+                .map_err(|error| format!("无法复制章节：{error}"))?;
+            for (key, value) in metadata {
+                chapter.set_metadata(key, value);
+            }
+        }
+        let statistics_writing_date = Self::statistics_writing_date_utc();
         let mut output_indices = HashMap::new();
         let mut new_subtitle_output_indices = Vec::with_capacity(new_subtitles.len());
         let mut matched_default_output = false;
@@ -1489,6 +1687,7 @@ impl FfmpegService for FFIFfmpegService {
                             edit,
                             default_subtitle,
                             position,
+                            &statistics_writing_date,
                         )?;
                         matched_default_output |= matches!(
                             default_subtitle,
@@ -1554,6 +1753,18 @@ impl FfmpegService for FFIFfmpegService {
             {
                 metadata.set("title", title);
             }
+            if let Some(edit) = replacements.get(&stream.index()) {
+                // 中文：替换字幕后源轨统计值立即失效，必须在写 header 前按新内容重新计算。
+                // English: The original statistics describe the source packets and become invalid as soon
+                // as subtitle text or format is replaced.  Recalculate them before the Matroska
+                // header is written instead of retaining plausible-looking but incorrect tags.
+                Self::set_subtitle_statistics(
+                    &mut metadata,
+                    edit,
+                    stream.time_base(),
+                    &statistics_writing_date,
+                )?;
+            }
             output_stream.set_metadata(metadata);
             if Self::stream_type(stream.parameters().medium()) == MediaStreamType::Subtitle {
                 let output_stream_index = output_stream.index();
@@ -1580,8 +1791,13 @@ impl FfmpegService for FFIFfmpegService {
                 return Err("新建字幕必须被选择导出。".to_string());
             }
             for (position, edit) in new_subtitles.iter().enumerate() {
-                let index =
-                    Self::add_new_subtitle_stream(&mut output, edit, default_subtitle, position)?;
+                let index = Self::add_new_subtitle_stream(
+                    &mut output,
+                    edit,
+                    default_subtitle,
+                    position,
+                    &statistics_writing_date,
+                )?;
                 matched_default_output |= matches!(
                     default_subtitle,
                     Some(DefaultSubtitleSelector::OutputStream(target)) if target == index as u32
@@ -1634,7 +1850,78 @@ impl FfmpegService for FFIFfmpegService {
             .write_header()
             .map_err(|error| format!("无法写入 MKV 头：{error}"))?;
 
-        let mut emitted_replacements = HashSet::new();
+        // 中文：先生成所有新增/替换字幕包并统一换算为微秒排序。旧实现是在音视频全部
+        // 写完后才追加字幕，导致时间戳为 0.6 秒的第一条 ASS Block 实际位于 1.4 GB
+        // 文件的末尾；ffprobe 能跳转识别，但 VLC 顺序播放时无法及时取得字幕。
+        // English: pre-build generated subtitle packets and sort them on one microsecond timeline
+        // so they can be physically interleaved with audio/video instead of appended at EOF.
+        let mut generated_subtitle_packets = Vec::new();
+        for (&input_index, edit) in &replacements {
+            let output_index = output_indices[&input_index];
+            let stream = input
+                .streams()
+                .find(|stream| stream.index() == input_index)
+                .expect("validated replacement stream");
+            let time_base = stream.time_base();
+            let target_format = edit.format.as_deref().unwrap_or_else(|| {
+                if canonical_codec_name(stream.parameters().id().name()) == "ass" {
+                    "ass"
+                } else {
+                    "srt"
+                }
+            });
+            let content = if target_format == "ass" {
+                Self::ass_document_parts(&edit.content)?.1
+            } else {
+                edit.content.as_str()
+            };
+            let packets = if target_format == "ass" {
+                Self::ass_packets(content, time_base)?
+            } else {
+                Self::srt_packets(content, time_base)?
+            };
+            for (payload, pts, duration) in packets {
+                let mut packet = ffmpeg_next::Packet::copy(payload.as_bytes());
+                packet.set_stream(output_index);
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(pts));
+                packet.set_duration(duration);
+                generated_subtitle_packets.push((
+                    pts.saturating_mul(i64::from(time_base.numerator()))
+                        .saturating_mul(1_000_000)
+                        / i64::from(time_base.denominator()),
+                    packet,
+                ));
+            }
+        }
+        for (position, edit) in new_subtitles.iter().enumerate() {
+            let output_index = new_subtitle_output_indices[position];
+            let time_base = ffmpeg_next::Rational::new(1, 1_000);
+            let format = edit
+                .format
+                .as_deref()
+                .expect("validated new subtitle format");
+            let content = if format == "ass" {
+                Self::ass_document_parts(&edit.content)?.1
+            } else {
+                edit.content.as_str()
+            };
+            let packets = if format == "ass" {
+                Self::ass_packets(content, time_base)?
+            } else {
+                Self::srt_packets(content, time_base)?
+            };
+            for (payload, pts, duration) in packets {
+                let mut packet = ffmpeg_next::Packet::copy(payload.as_bytes());
+                packet.set_stream(output_index);
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(pts));
+                packet.set_duration(duration);
+                generated_subtitle_packets.push((pts.saturating_mul(1_000), packet));
+            }
+        }
+        generated_subtitle_packets.sort_by_key(|(timestamp, _)| *timestamp);
+        let mut generated_subtitle_packets = generated_subtitle_packets.into_iter().peekable();
         let mut generated_dts = HashMap::new();
         let mut streams_without_dts = HashSet::new();
         for (stream, packet) in input.packets() {
@@ -1642,47 +1929,9 @@ impl FfmpegService for FFIFfmpegService {
             let Some(&output_index) = output_indices.get(&index) else {
                 continue;
             };
-            if let Some(edit) = replacements.get(&index) {
-                if emitted_replacements.insert(index) {
-                    let target_format = edit.format.as_deref().unwrap_or_else(|| {
-                        if canonical_codec_name(stream.parameters().id().name()) == "ass" {
-                            "ass"
-                        } else {
-                            "srt"
-                        }
-                    });
-                    let content = if target_format == "ass" {
-                        Self::ass_document_parts(&edit.content)?.1
-                    } else {
-                        edit.content.as_str()
-                    };
-                    if target_format == "ass" {
-                        for (dialogue, pts, duration) in
-                            Self::ass_packets(content, stream.time_base())?
-                        {
-                            let mut replacement = ffmpeg_next::Packet::copy(dialogue.as_bytes());
-                            replacement.set_stream(output_index);
-                            replacement.set_pts(Some(pts));
-                            replacement.set_dts(Some(pts));
-                            replacement.set_duration(duration);
-                            replacement
-                                .write(&mut output)
-                                .map_err(|error| format!("无法写入编辑后的 ASS 字幕：{error}"))?;
-                        }
-                    } else {
-                        for (text, pts, duration) in Self::srt_packets(content, stream.time_base())?
-                        {
-                            let mut replacement = ffmpeg_next::Packet::copy(text.as_bytes());
-                            replacement.set_stream(output_index);
-                            replacement.set_pts(Some(pts));
-                            replacement.set_dts(Some(pts));
-                            replacement.set_duration(duration);
-                            replacement
-                                .write(&mut output)
-                                .map_err(|error| format!("无法写入编辑后的字幕：{error}"))?;
-                        }
-                    }
-                }
+            // 中文：替换轨的原包必须全部丢弃；替换后的包已经进入上面的统一时间线。
+            // English: replacement packets are queued above, so discard every original packet.
+            if replacements.contains_key(&index) {
                 continue;
             }
             let mut packet = normalize_media_packet(packet, stream.parameters().medium())?;
@@ -1692,6 +1941,11 @@ impl FfmpegService for FFIFfmpegService {
                 streams_without_dts.insert(index);
             }
             if streams_without_dts.contains(&index) {
+                // 中文：部分压缩 Matroska 轨没有 DTS；为交织写入生成单调 DTS，并保证
+                // PTS 不早于 DTS，避免输出被识别但播放时黑屏无声。
+                // English: Some compressed Matroska tracks in the regression fixtures have no DTS. The
+                // output muxer needs monotonically increasing DTS for interleaving; synthesize it
+                // while keeping PTS at or after DTS to avoid an unplayable black/silent result.
                 let next_dts = generated_dts.entry(index).or_insert_with(|| {
                     packet
                         .pts()
@@ -1704,50 +1958,36 @@ impl FfmpegService for FFIFfmpegService {
                 }
                 *next_dts = next_dts.saturating_add(packet.duration().max(1));
             }
+            let packet_timestamp = packet
+                .dts()
+                .or_else(|| packet.pts())
+                .unwrap_or_default()
+                .saturating_mul(i64::from(stream.time_base().numerator()))
+                .saturating_mul(1_000_000)
+                / i64::from(stream.time_base().denominator());
+            while generated_subtitle_packets
+                .peek()
+                .is_some_and(|(timestamp, _)| *timestamp <= packet_timestamp)
+            {
+                let (_, subtitle_packet) = generated_subtitle_packets
+                    .next()
+                    .expect("peeked generated subtitle packet");
+                subtitle_packet
+                    .write_interleaved(&mut output)
+                    .map_err(|error| format!("无法按时间线写入字幕：{error}"))?;
+            }
             packet.set_stream(output_index);
             packet
                 .write_interleaved(&mut output)
                 .map_err(|error| format!("无法写入媒体数据：{error}"))?;
         }
 
-        for (position, edit) in new_subtitles.iter().enumerate() {
-            let output_index = new_subtitle_output_indices[position];
-            let format = edit
-                .format
-                .as_deref()
-                .expect("validated new subtitle format");
-            let content = if format == "ass" {
-                Self::ass_document_parts(&edit.content)?.1
-            } else {
-                edit.content.as_str()
-            };
-            if format == "ass" {
-                for (dialogue, pts, duration) in
-                    Self::ass_packets(content, ffmpeg_next::Rational::new(1, 1_000))?
-                {
-                    let mut packet = ffmpeg_next::Packet::copy(dialogue.as_bytes());
-                    packet.set_stream(output_index);
-                    packet.set_pts(Some(pts));
-                    packet.set_dts(Some(pts));
-                    packet.set_duration(duration);
-                    packet
-                        .write(&mut output)
-                        .map_err(|error| format!("无法写入新 ASS 字幕：{error}"))?;
-                }
-            } else {
-                for (text, pts, duration) in
-                    Self::srt_packets(content, ffmpeg_next::Rational::new(1, 1_000))?
-                {
-                    let mut packet = ffmpeg_next::Packet::copy(text.as_bytes());
-                    packet.set_stream(output_index);
-                    packet.set_pts(Some(pts));
-                    packet.set_dts(Some(pts));
-                    packet.set_duration(duration);
-                    packet
-                        .write(&mut output)
-                        .map_err(|error| format!("无法写入新字幕：{error}"))?;
-                }
-            }
+        // 中文：输入媒体结束后只会剩下时间戳晚于最后一个输入包的字幕。
+        // English: flush only subtitle packets whose timestamps follow the final input packet.
+        for (_, packet) in generated_subtitle_packets {
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|error| format!("无法写入剩余字幕：{error}"))?;
         }
 
         output
@@ -2086,11 +2326,22 @@ impl Drop for TemporaryRemuxFiles {
 }
 
 struct MkvmergeFfmpegService {
+    // 中文：探测和字幕解码继续走进程内 FFI，仅把最终 Matroska 封装交给对 VLC 内嵌
+    // ASS 兼容性更稳定的 mkvmerge。
+    // Inspection and subtitle decoding remain in-process; only the final Matroska mux is delegated
+    // because mkvmerge has proven more compatible with VLC for embedded ASS tracks.
     ffi: FFIFfmpegService,
     executable: PathBuf,
 }
 
 impl MkvmergeFfmpegService {
+    /// Finds a bundled mkvmerge first, then falls back to PATH.
+    ///
+    /// 中文：优先查找程序同目录的随附版本，再查 PATH；执行 `--version` 可排除同名但
+    /// 不可运行的文件，并让检测失败时安全回退到原有实现。
+    ///
+    /// Checking `--version` prevents selecting a stale/non-executable file and lets callers safely
+    /// fall back to the existing CLI/FFI services when MKVToolNix is not installed.
     fn detect() -> Option<Self> {
         let mut candidates = std::env::current_exe()
             .ok()
@@ -2113,6 +2364,14 @@ impl MkvmergeFfmpegService {
         })
     }
 
+    /// Reads mkvmerge's own track and attachment IDs.
+    ///
+    /// 中文：FFmpeg stream index 不保证等于 mkvmerge track ID，直接混用可能静默选择
+    /// 错误的字幕或附件，因此必须读取、核对并建立显式映射。
+    ///
+    /// FFmpeg stream indices are not guaranteed to equal Matroska/mkvmerge IDs.  Passing FFmpeg
+    /// indices directly to `--*-tracks` can silently select the wrong subtitle or attachment, so
+    /// remuxing first establishes and validates an explicit mapping between both views.
     fn identify(&self, input: &Path) -> Result<MkvmergeIdentification, String> {
         let output = self
             .command()
@@ -2192,6 +2451,11 @@ impl FfmpegService for MkvmergeFfmpegService {
         default_subtitle: Option<DefaultSubtitleSelector>,
         font_attachments: &[FontAttachment],
     ) -> Result<(), String> {
+        // 中文：应用媒体模型仍以 FFI 为准，但命令参数必须使用 mkvmerge 自己的 ID；
+        // 两边的轨道清单不一致时立即失败，避免生成表面成功但轨道错误的文件。
+        // English: Keep FFI as the source of the application's MediaFile model, but ask mkvmerge for its
+        // native IDs before building command arguments.  The two inventories are checked below so
+        // an unexpected demuxer disagreement fails loudly instead of producing a subtly corrupt MKV.
         let media = self.ffi.inspect(input)?;
         let identification = self.identify(input)?;
         let selected = selected_stream_indices
@@ -2296,6 +2560,11 @@ impl FfmpegService for MkvmergeFfmpegService {
             Original(&'a MediaStream),
             External(usize, &'a SubtitleEdit),
         }
+        // 中文：mkvmerge 默认把外部字幕追加到最后，必须显式设置轨道顺序，才能保证新 ASS
+        // 位于原字幕之前，并让 --default-index 始终对应最终输出索引。
+        // English: mkvmerge appends external inputs by default. Explicit track order is required to retain
+        // the CLI contract that newly converted ASS tracks appear before the original subtitles and
+        // that `--default-index` refers to the final output stream order.
         let mut ordered_tracks = Vec::new();
         let mut inserted_new_subtitles = false;
         for stream in media
@@ -3784,6 +4053,32 @@ mod tests {
         }
         let output_header_context =
             ffmpeg_next::format::input(&output).expect("应能读取输出文件的 ASS 字幕头");
+        let input_chapters = ffmpeg_next::format::input(&input)
+            .expect("应能读取输入章节")
+            .chapters()
+            .map(|chapter| {
+                (
+                    chapter.id(),
+                    chapter.time_base(),
+                    chapter.start(),
+                    chapter.end(),
+                    chapter.metadata().get("title").map(str::to_string),
+                )
+            })
+            .collect::<Vec<_>>();
+        let output_chapters = output_header_context
+            .chapters()
+            .map(|chapter| {
+                (
+                    chapter.id(),
+                    chapter.time_base(),
+                    chapter.start(),
+                    chapter.end(),
+                    chapter.metadata().get("title").map(str::to_string),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_chapters, input_chapters, "FFI 混流应完整保留章节");
         let ass_header = output_header_context
             .streams()
             .find(|stream| stream.index() == 2)
@@ -3800,7 +4095,18 @@ mod tests {
             })
             .expect("输出的第 2 流应包含 ASS 字幕头");
         assert!(ass_header.ends_with(b"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n\r\n"));
-
+        let mut packet_order_context =
+            ffmpeg_next::format::input(&output).expect("应能检查输出包顺序");
+        let first_generated_subtitle_position = packet_order_context
+            .packets()
+            .find_map(|(stream, packet)| (stream.index() == 2).then(|| packet.position()))
+            .expect("输出应包含新生成的字幕包");
+        let output_size = fs::metadata(&output).expect("应能读取输出文件大小").len();
+        assert!(
+            first_generated_subtitle_position >= 0
+                && first_generated_subtitle_position as u64 <= output_size / 2,
+            "新字幕包应按时间线穿插写入，不能追加到完整音视频之后"
+        );
         let mut input_context = ffmpeg_next::format::input(&input).expect("应能读取 zib.mkv");
         let (input_stream, input_packet) = input_context
             .packets()
@@ -3885,6 +4191,36 @@ mod tests {
             .iter()
             .find(|stream| stream.title.as_deref() == Some("新建字幕测试"))
             .expect("输出文件应包含新建字幕流");
+        let output_context = ffmpeg_next::format::input(&output).expect("应能读取字幕统计信息");
+        let metadata = output_context
+            .streams()
+            .find(|candidate| candidate.index() == stream.index as usize)
+            .expect("应能按索引找到新建字幕流")
+            .metadata()
+            .to_owned();
+        let edit = SubtitleEdit {
+            stream_index: NEW_SUBTITLE_STREAM_INDEX,
+            content: content.to_string(),
+            format: Some("srt".to_string()),
+            language: Some("chi".to_string()),
+            title: Some("新建字幕测试".to_string()),
+            new_stream: true,
+        };
+        let (bps, _, frames, bytes) =
+            FFIFfmpegService::subtitle_statistics(&edit, ffmpeg_next::Rational::new(1, 1_000))
+                .expect("应能计算字幕统计信息");
+        assert_eq!(metadata.get("BPS"), Some(bps.as_str()));
+        assert_eq!(metadata.get("NUMBER_OF_FRAMES"), Some(frames.as_str()));
+        assert_eq!(metadata.get("NUMBER_OF_BYTES"), Some(bytes.as_str()));
+        assert_eq!(
+            metadata.get("_STATISTICS_TAGS"),
+            Some("BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES")
+        );
+        assert_eq!(
+            metadata.get("_STATISTICS_WRITING_APP"),
+            Some("mkvtool FFmpeg FFI")
+        );
+        assert!(metadata.get("_STATISTICS_WRITING_DATE_UTC").is_some());
         let read = service
             .read_subtitle(&output, stream.index)
             .expect("FFI FFmpeg 应能读取新建字幕流");
